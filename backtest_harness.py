@@ -3,17 +3,16 @@ backtest_harness.py  —  AutoFin Evaluation Engine & LLM Orchestration
 =======================================================================
 THIS FILE IS READ-ONLY TO THE LLM.
 
-Dependencies (all standard, no GPTQ / bitsandbytes needed):
-    pip install yfinance pandas numpy transformers accelerate
+Analogous to prepare.py in AutoResearch:
+  - Fixed evaluation metric (composite_score) — do not modify.
+  - Data loading, sharding, trade simulation — do not modify.
+  - LLM orchestration loop — do not modify.
 
-Recommended models for Colab free T4 (16 GB VRAM):
-    Qwen/Qwen2.5-7B-Instruct     ~14 GB bfloat16  ← default, safe on T4
-    Qwen/Qwen2.5-3B-Instruct     ~6  GB bfloat16  ← very safe, slightly weaker
-    google/gemma-2-2b-it          ~4  GB bfloat16  ← lightest option
+The LLM only sees program.md and strategy.py. It never sees this file.
 
 Usage:
-    python backtest_harness.py --ticker NVDA --device cuda --iterations 10
     python backtest_harness.py --ticker "^GSPC" --device cuda --forever
+    python backtest_harness.py --ticker "^NDX"  --device cuda --iterations 20
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import traceback
 import warnings
 from datetime import datetime
@@ -38,46 +38,45 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (all relative to the directory containing this file)
 # ---------------------------------------------------------------------------
 
 ROOT          = Path(__file__).parent.resolve()
-PROGRAM_FILE  = ROOT / "program.md"
-STRATEGY_FILE = ROOT / "strategy.py"
-BEST_FILE     = ROOT / "best_strategy.py"
-LOG_FILE      = ROOT / "autofin_log.jsonl"
-RESULTS_TSV   = ROOT / "results.tsv"
-TRIGGER_FILE  = ROOT / "push_trigger.json"
+PROGRAM_FILE  = ROOT / "program.md"          # LLM reads this
+STRATEGY_FILE = ROOT / "strategy.py"         # LLM writes this
+BEST_FILE     = ROOT / "best_strategy.py"    # snapshot of the best-ever strategy
+LOG_FILE      = ROOT / "autofin_log.jsonl"   # machine-readable full log
+RESULTS_TSV   = ROOT / "results.tsv"         # human-readable experiment table (untracked)
+TRIGGER_FILE  = ROOT / "push_trigger.json"   # watched by external GitHub MCP
+
 
 # ---------------------------------------------------------------------------
-# TSV results log
+# TSV results log (mirrors AutoResearch's results.tsv)
 # ---------------------------------------------------------------------------
 
 TSV_HEADER = "iteration\taggregate_score\tstatus\tdescription\tparams_snapshot\n"
 
 
 def init_results_tsv() -> None:
+    """Create results.tsv with header if it doesn't exist."""
     if not RESULTS_TSV.exists():
         RESULTS_TSV.write_text(TSV_HEADER)
         print(f"[log] Initialised {RESULTS_TSV}")
-    else:
-        print(f"[log] Appending to existing {RESULTS_TSV}")
 
 
 def append_results_tsv(
     iteration: int,
     score: float,
-    status: str,
+    status: str,       # "keep" | "discard" | "crash" | "baseline"
     description: str,
     params: dict,
 ) -> None:
+    """Append one row to results.tsv (tab-separated, no commas in description)."""
     params_str = json.dumps(params).replace("\t", " ")
     desc       = description.replace("\t", " ").replace("\n", " ")
     row = f"{iteration}\t{score:.6f}\t{status}\t{desc}\t{params_str}\n"
     with open(RESULTS_TSV, "a") as fh:
         fh.write(row)
-    # Also flush to stdout so we can see it even inside subprocess
-    print(f"[tsv] {row.strip()}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +84,11 @@ def append_results_tsv(
 # ---------------------------------------------------------------------------
 
 def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Download daily OHLCV data from Yahoo Finance."""
     print(f"[data] Downloading {ticker}  {start} → {end} ...")
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
 
-    # yfinance ≥0.2 returns MultiIndex columns — flatten
+    # yfinance sometimes returns MultiIndex columns — flatten them
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
 
@@ -100,6 +100,10 @@ def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFrame]:
+    """
+    Split DataFrame into year-wide shards (keyed by 'YYYY').
+    Shards with fewer than 20 bars are skipped (incomplete years).
+    """
     shards: dict[str, pd.DataFrame] = {}
     for yr in sorted(df.index.year.unique()):
         if yr < start_year:
@@ -111,13 +115,20 @@ def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFr
 
 
 # ---------------------------------------------------------------------------
-# Trade simulator
+# Trade simulator  (fixed — do not modify)
 # ---------------------------------------------------------------------------
 
 def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert a signal series into daily strategy returns.
+
+    Positions are determined at the close of the signal bar and executed on
+    the next bar (lag by 1) to avoid look-ahead bias.
+    """
     pos     = signals["signal"].shift(1).fillna(0)
     log_ret = np.log(df["Close"] / df["Close"].shift(1)).fillna(0)
     strat   = pos * log_ret
+
     return pd.DataFrame({
         "position":          pos,
         "strategy_log_ret":  strat,
@@ -132,7 +143,7 @@ def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
 
 def sharpe_ratio(daily_returns: pd.Series, periods: int = 252) -> float:
     std = daily_returns.std()
-    if std == 0 or math.isnan(float(std)):
+    if std == 0 or math.isnan(std):
         return 0.0
     return float(daily_returns.mean() / std * math.sqrt(periods))
 
@@ -152,11 +163,15 @@ def max_drawdown(daily_returns: pd.Series) -> float:
 
 
 def composite_score(sharpe: float, pf: float, mdd: float) -> float:
-    """score = Sharpe×0.6 + ProfitFactor×0.2 − MaxDrawdown×0.2  (fixed metric)"""
+    """
+    score = Sharpe_Ratio × 0.6  +  Profit_Factor × 0.2  −  Max_Drawdown × 0.2
+    This is the FIXED metric. Do not change.
+    """
     return round(sharpe * 0.6 + pf * 0.2 - mdd * 0.2, 6)
 
 
 def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
+    """Run strategy on one shard and return a metrics dict."""
     try:
         signals  = generate_signals_fn(shard)
         trades   = simulate_trades(shard, signals)
@@ -167,9 +182,9 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
         sc       = composite_score(sh, pf_, mdd)
         n_trades = int((signals["signal"].diff().abs() > 0).sum())
         return {
-            "sharpe":        round(sh,  4),
-            "profit_factor": round(pf_, 4),
-            "max_drawdown":  round(mdd, 4),
+            "sharpe":        round(sh,   4),
+            "profit_factor": round(pf_,  4),
+            "max_drawdown":  round(mdd,  4),
             "score":         sc,
             "n_trades":      n_trades,
             "n_bars":        len(shard),
@@ -189,6 +204,7 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_strategy(path: Path):
+    """Dynamically load (or reload) strategy.py. Returns the module."""
     spec   = importlib.util.spec_from_file_location("strategy", str(path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -196,37 +212,35 @@ def load_strategy(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# LLM  — plain HuggingFace Transformers, bfloat16, NO quantization libraries
+# LLM — HuggingFace open-source (Qwen / Gemma), 4-bit quantised
 # ---------------------------------------------------------------------------
 
 def build_llm_pipeline(model_id: str, device: str):
     """
-    Load a plain instruct model in bfloat16.
+    Load a Qwen instruct model via HuggingFace Transformers.
+    No quantisation — uses float16 with device_map='auto' (mirrors the
+    Phi-3 loading pattern from the financial analysis agent notebook).
 
-    No GPTQ, no bitsandbytes, no auto-gptq — just transformers + accelerate.
-    Works on any Colab GPU tier out of the box.
-
-    VRAM usage at bfloat16:
-        Qwen/Qwen2.5-3B-Instruct   ~6  GB   (very safe on free T4)
-        Qwen/Qwen2.5-7B-Instruct   ~14 GB   (safe on free T4)
-        Qwen/Qwen2.5-14B-Instruct  ~28 GB   (Colab Pro A100 only)
+    Recommended model IDs:
+      Qwen/Qwen2.5-72B-Instruct   (A100, best reasoning)
+      Qwen/Qwen2.5-32B-Instruct   (L4, good balance)
+      Qwen/Qwen2.5-7B-Instruct    (smaller GPU, faster)
     """
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
-    print(f"[llm] Loading {model_id} in bfloat16 on {device} ...")
-    print(f"[llm] Available VRAM: "
-          f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        trust_remote_code=True,
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        pipeline,
     )
+    import torch
+
+    print(f"[llm] Loading {model_id} on {device} ...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,   # half precision — no quantization library needed
-        device_map="auto",             # HF places layers on GPU automatically
+        torch_dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True,
     )
     model.eval()
@@ -240,14 +254,12 @@ def build_llm_pipeline(model_id: str, device: str):
         do_sample=True,
         return_full_text=False,
     )
-
-    used_vram = torch.cuda.memory_allocated() / 1024**3
-    print(f"[llm] Model loaded. VRAM used: {used_vram:.1f} GB")
+    print("[llm] Model loaded.")
     return pipe
 
 
 # ---------------------------------------------------------------------------
-# Prompt construction  — injects program.md verbatim
+# Prompt construction  — injects program.md verbatim, just like AutoResearch
 # ---------------------------------------------------------------------------
 
 def build_prompt(
@@ -258,25 +270,39 @@ def build_prompt(
     iteration: int,
     history: list[dict],
 ) -> list[dict]:
-    # Per-shard table
+    """
+    Build the chat-format messages list for the LLM.
+
+    The LLM receives:
+      - program.md verbatim as the system prompt  (read-only context)
+      - current strategy.py + results as the user message  (writable context)
+
+    This mirrors AutoResearch where the LLM is told to 'read these files for
+    full context' and program.md is the live spec.
+    """
+    # ---- Per-shard results table ----
     rows = []
     for yr, m in shard_results.items():
         err = f"  ERR: {m['error'][:50]}" if m["error"] else ""
         rows.append(
-            f"  {yr} | Sharpe={m['sharpe']:>7.4f} | PF={m['profit_factor']:>5.2f}"
-            f" | MDD={m['max_drawdown']:>5.3f} | Score={m['score']:>8.5f}"
-            f" | Trades={m['n_trades']:>4}{err}"
+            f"  {yr} | Sharpe={m['sharpe']:>7.4f} | PF={m['profit_factor']:>5.2f} "
+            f"| MDD={m['max_drawdown']:>5.3f} | Score={m['score']:>8.5f} "
+            f"| Trades={m['n_trades']:>4}{err}"
         )
     shard_table = "\n".join(rows)
 
-    # Last 5 iterations of history
+    # ---- Last 5 iterations of score history ----
     hist_lines = [
-        f"  iter {h['iteration']:>3}: aggregate={h['aggregate_score']:.5f}  status={h['status']}"
+        f"  iter {h['iteration']:>3}: aggregate={h['aggregate_score']:.5f}  "
+        f"status={h['status']}"
         for h in history[-5:]
     ] or ["  (no history yet — this is the baseline run)"]
     hist_str = "\n".join(hist_lines)
 
-    # Iteration-specific instruction
+    # ---- System prompt = program.md verbatim ----
+    system_prompt = program_source
+
+    # ---- User message = results + current strategy ----
     if iteration == 1:
         task_line = (
             "This is iteration 1 — the BASELINE run. "
@@ -285,8 +311,8 @@ def build_prompt(
     else:
         task_line = (
             f"The previous aggregate score was {aggregate_score:.5f}. "
-            "Propose an improved strategy.py. Be hypothesis-driven and reference "
-            "the weakest shards in your reasoning."
+            "Propose an improved strategy.py. Be hypothesis-driven. "
+            "Reference the weakest shards in your reasoning."
         )
 
     user_content = (
@@ -299,7 +325,7 @@ def build_prompt(
     )
 
     return [
-        {"role": "system", "content": program_source},   # program.md verbatim
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_content},
     ]
 
@@ -309,18 +335,24 @@ def build_prompt(
 # ---------------------------------------------------------------------------
 
 def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract <reasoning> and <strategy> blocks from LLM output."""
     r_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL | re.IGNORECASE)
     s_match = re.search(r"<strategy>(.*?)</strategy>",   text, re.DOTALL | re.IGNORECASE)
+
     reasoning = r_match.group(1).strip() if r_match else None
     strategy  = s_match.group(1).strip() if s_match else None
+
     if strategy:
+        # Strip accidental markdown fences
         strategy = re.sub(r"^```[a-zA-Z]*\n?", "", strategy)
         strategy = re.sub(r"\n?```$",           "", strategy)
         strategy = strategy.strip()
+
     return reasoning, strategy
 
 
 def validate_syntax(code: str) -> tuple[bool, str]:
+    """Return (ok, error_message)."""
     try:
         compile(code, "<strategy>", "exec")
         return True, ""
@@ -329,13 +361,17 @@ def validate_syntax(code: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Loggers
+# JSONL logger
 # ---------------------------------------------------------------------------
 
 def log_jsonl(record: dict) -> None:
     with open(LOG_FILE, "a") as fh:
         fh.write(json.dumps(record) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# GitHub MCP trigger
+# ---------------------------------------------------------------------------
 
 def write_trigger(score: float, iteration: int, params: dict) -> None:
     payload = {
@@ -349,7 +385,7 @@ def write_trigger(score: float, iteration: int, params: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main loop — mirrors AutoResearch's experiment loop exactly
 # ---------------------------------------------------------------------------
 
 def run(
@@ -358,20 +394,15 @@ def run(
     end:        str,
     model_id:   str,
     device:     str,
-    iterations: int,
+    iterations: int,       # ignored when forever=True
     forever:    bool,
     patience:   int,
     start_year: int,
 ) -> None:
 
+    # ---- Setup ----
     init_results_tsv()
 
-    # Load program.md from disk — injected into every LLM prompt verbatim
-    if not PROGRAM_FILE.exists():
-        raise FileNotFoundError(
-            f"program.md not found at {PROGRAM_FILE}. "
-            "Make sure all three files are in the same directory."
-        )
     program_source = PROGRAM_FILE.read_text()
     print(f"[init] Loaded program.md ({len(program_source)} chars)")
 
@@ -379,7 +410,6 @@ def run(
     shards = make_shards(df, start_year=start_year)
     print(f"[data] Shards: {list(shards.keys())}")
 
-    # Load model once — stays in VRAM for the entire run
     pipe = build_llm_pipeline(model_id, device)
 
     best_score = -math.inf
@@ -387,6 +417,7 @@ def run(
     history: list[dict] = []
     iteration  = 0
 
+    # ---- Loop forever (like AutoResearch) or up to iterations ----
     while True:
         iteration += 1
         if not forever and iteration > iterations:
@@ -395,23 +426,24 @@ def run(
 
         print(f"\n{'='*62}")
         print(f"  AutoFin  Iteration {iteration}" + ("" if forever else f"/{iterations}"))
-        print(f"{'='*62}", flush=True)
+        print(f"{'='*62}")
 
-        # ---- Load & validate strategy ----
+        # ---- Load strategy ----
         try:
-            strat               = load_strategy(STRATEGY_FILE)
+            strat = load_strategy(STRATEGY_FILE)
             generate_signals_fn = strat.generate_signals
             current_params      = strat.get_params()
         except Exception as exc:
             print(f"[strategy] CRASH loading strategy.py: {exc}")
             traceback.print_exc()
+            # Roll back to best known good
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
                 print("[strategy] Rolled back to best_strategy.py")
             append_results_tsv(iteration, 0.0, "crash", f"load error: {exc}", {})
             continue
 
-        # ---- Run backtests on all shards ----
+        # ---- Evaluate on all shards ----
         shard_results: dict[str, dict] = {}
         any_crash = False
         for year, shard_df in shards.items():
@@ -421,32 +453,28 @@ def run(
             if m["error"]:
                 any_crash = True
             print(
-                f"Sharpe={m['sharpe']:>7.4f}  PF={m['profit_factor']:>5.2f}"
-                f"  MDD={m['max_drawdown']:>5.3f}  Score={m['score']:>8.5f}"
-                f"  Trades={m['n_trades']:>4}"
-                + (f"  [ERR: {m['error']}]" if m["error"] else ""),
-                flush=True,
+                f"Sharpe={m['sharpe']:>7.4f}  PF={m['profit_factor']:>5.2f}  "
+                f"MDD={m['max_drawdown']:>5.3f}  Score={m['score']:>8.5f}  "
+                f"Trades={m['n_trades']:>4}"
+                + (f"  [ERR: {m['error']}]" if m["error"] else "")
             )
 
         valid_scores = [m["score"] for m in shard_results.values() if not m["error"]]
         aggregate    = float(np.mean(valid_scores)) if valid_scores else -99.0
-        print(f"\n  ► Aggregate: {aggregate:.5f}   Best so far: {best_score:.5f}", flush=True)
+        print(f"\n  ► Aggregate: {aggregate:.5f}   Best so far: {best_score:.5f}")
 
-        # ---- Status ----
+        # ---- Determine status: keep / discard / crash ----
         if any_crash and not valid_scores:
             status      = "crash"
             description = "all shards errored"
-        elif iteration == 1:
-            status      = "baseline"
-            description = f"baseline: aggregate={aggregate:.5f}"
         elif aggregate > best_score:
-            status      = "keep"
-            description = f"iter {iteration}: improved to {aggregate:.5f}"
+            status      = "keep" if iteration > 1 else "baseline"
+            description = f"iter {iteration}: aggregate={aggregate:.5f}"
         else:
-            status      = "discard"
-            description = f"iter {iteration}: no improvement ({aggregate:.5f} <= {best_score:.5f})"
+            status      = "discard" if iteration > 1 else "baseline"
+            description = f"iter {iteration}: no improvement ({aggregate:.5f} vs {best_score:.5f})"
 
-        # ---- Log everything immediately ----
+        # ---- Log ----
         record = {
             "iteration":       iteration,
             "aggregate_score": aggregate,
@@ -459,7 +487,7 @@ def run(
         append_results_tsv(iteration, aggregate, status, description, current_params)
         history.append(record)
 
-        # ---- Advance or roll back ----
+        # ---- Advance or roll back (AutoResearch pattern) ----
         if aggregate > best_score:
             best_score = aggregate
             no_improve = 0
@@ -468,16 +496,18 @@ def run(
             write_trigger(best_score, iteration, current_params)
         else:
             no_improve += 1
+            # ROLL BACK — restore strategy.py to the best known good version
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
-                print(f"  ✗ Rolled back to best_strategy.py  "
-                      f"(no_improve={no_improve}/{patience})")
+                print(f"  ✗ Rolled back to best_strategy.py  (no_improve={no_improve}/{patience})")
             if no_improve >= patience and not forever:
                 print("[loop] Plateau reached. Stopping.")
                 break
 
-        # ---- Build LLM prompt (re-read after possible rollback) ----
+        # ---- Call LLM for next proposal ----
+        # Re-read strategy source AFTER potential rollback
         strategy_source = STRATEGY_FILE.read_text()
+
         messages = build_prompt(
             program_source  = program_source,
             strategy_source = strategy_source,
@@ -487,10 +517,9 @@ def run(
             history         = history,
         )
 
-        # ---- Generate next strategy ----
-        print("\n[llm] Generating next strategy ...", flush=True)
+        print("\n[llm] Generating next strategy ...")
         try:
-            formatted  = pipe.tokenizer.apply_chat_template(
+            formatted = pipe.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
@@ -500,31 +529,33 @@ def run(
         except Exception as exc:
             print(f"[llm] Generation failed: {exc}")
             traceback.print_exc()
+            # Don't break the loop — the harness will re-run current best next iter
             continue
 
         reasoning, new_strategy = parse_llm_response(llm_output)
 
         if reasoning:
-            print(f"\n[llm] Reasoning:\n{reasoning[:400]}"
-                  f"{'...' if len(reasoning) > 400 else ''}\n")
+            print(f"\n[llm] Reasoning: {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}\n")
 
         if not new_strategy:
-            print("[parse] No <strategy> block found. Keeping current best.")
+            print("[parse] No <strategy> block found. Re-running current best next iteration.")
             continue
 
         syntax_ok, syntax_err = validate_syntax(new_strategy)
         if not syntax_ok:
             print(f"[parse] Syntax error — keeping current best. Error: {syntax_err}")
+            # Log the crash but don't overwrite strategy.py
             append_results_tsv(
                 iteration + 1, 0.0, "crash",
                 f"syntax error: {syntax_err[:80]}", {}
             )
             continue
 
+        # ---- Write the new strategy for the next evaluation ----
         STRATEGY_FILE.write_text(new_strategy)
-        print("[strategy] strategy.py updated for next iteration.", flush=True)
+        print("[strategy] strategy.py updated for next iteration.")
 
-    # ---- Summary ----
+    # ---- Final summary ----
     print(f"\n{'='*62}")
     print(f"  AutoFin complete.")
     print(f"  Best aggregate score : {best_score:.5f}")
@@ -545,28 +576,33 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--ticker", default="^GSPC",
-        help="Yahoo Finance ticker.\n  ^GSPC = S&P 500\n  ^NDX  = NASDAQ-100\n  NVDA  = single stock",
+        help="Yahoo Finance ticker.\n  ^GSPC = S&P 500 (default)\n  ^NDX  = NASDAQ-100",
     )
-    p.add_argument("--start",      default="2018-01-01")
-    p.add_argument("--end",        default="2024-12-31")
+    p.add_argument("--start",      default="2018-01-01",
+                   help="Data start date (YYYY-MM-DD)")
+    p.add_argument("--end",        default="2024-12-31",
+                   help="Data end date  (YYYY-MM-DD)")
     p.add_argument(
         "--model",
-        default="Qwen/Qwen2.5-7B-Instruct",
+        default="Qwen/Qwen2.5-32B-Instruct",
         help=(
-            "HuggingFace model ID (plain instruct, no GPTQ needed):\n"
-            "  Qwen/Qwen2.5-3B-Instruct   ~6  GB VRAM  (very safe on free T4)\n"
-            "  Qwen/Qwen2.5-7B-Instruct   ~14 GB VRAM  (default, fits free T4)\n"
-            "  Qwen/Qwen2.5-14B-Instruct  ~28 GB VRAM  (Colab Pro A100 only)\n"
-            "  google/gemma-2-2b-it        ~4  GB VRAM  (lightest option)"
+            "HuggingFace model ID.\n"
+            "  Qwen/Qwen2.5-72B-Instruct  (A100 — best)\n"
+            "  Qwen/Qwen2.5-32B-Instruct  (L4  — default)\n"
+            "  Qwen/Qwen2.5-7B-Instruct   (smaller GPU, faster)\n"
+            "  google/gemma-3-27b-it       (alternative)"
         ),
     )
-    p.add_argument("--device",     default="cuda")
-    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--device",     default="cuda",
+                   help="cuda | cpu")
+    p.add_argument("--iterations", type=int, default=20,
+                   help="Max iterations (ignored if --forever)")
     p.add_argument("--forever",    action="store_true",
-                   help="Run indefinitely until interrupted")
+                   help="Run indefinitely until interrupted (mirrors AutoResearch behaviour)")
     p.add_argument("--patience",   type=int, default=5,
-                   help="Stop after N consecutive non-improvements (ignored with --forever)")
-    p.add_argument("--start_year", type=int, default=2018)
+                   help="Stop after N consecutive non-improvements (only without --forever)")
+    p.add_argument("--start_year", type=int, default=2018,
+                   help="First shard year")
     return p.parse_args()
 
 
