@@ -40,7 +40,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
+import torch
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
@@ -612,6 +613,7 @@ def run(
             last_failed_score  = last_failed_score,
         )
 
+        torch.cuda.empty_cache()
         print("\n[llm] Generating next strategy ...")
         try:
             formatted  = pipe.tokenizer.apply_chat_template(
