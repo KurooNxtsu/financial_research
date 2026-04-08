@@ -272,21 +272,28 @@ def load_strategy(path: Path):
 # ---------------------------------------------------------------------------
 # LLM pipeline
 # ---------------------------------------------------------------------------
-
 def build_llm_pipeline(model_id: str, device: str):
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
+        BitsAndBytesConfig,
         pipeline,
     )
     import torch
 
     print(f"[llm] Loading {model_id} on {device} ...")
 
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=True,
     )
