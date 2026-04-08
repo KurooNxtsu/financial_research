@@ -109,47 +109,44 @@ def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 # Monthly sharding with warm-up buffer
 # ---------------------------------------------------------------------------
 
-def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFrame]:
+def make_shards(df: pd.DataFrame, start_year: int = 2016) -> dict[str, pd.DataFrame]:
     """
-    Split DataFrame into MONTHLY shards keyed as "YYYY-MM".
+    Split DataFrame into YEARLY shards keyed as "YYYY".
 
     Each shard value is the FULL slice including a WARMUP_DAYS-day history
-    buffer prepended before the target month. The evaluation functions must
+    buffer prepended before the target year. The evaluation functions must
     call strip_warmup() on the trade/return series before computing metrics
     so that warm-up bars are never scored.
 
-    Shards with fewer than 10 bars in the target month are skipped.
+    Shards with fewer than 50 bars in the target year are skipped.
     """
     shards: dict[str, pd.DataFrame] = {}
 
-    # All (year, month) pairs present in the data
-    periods = sorted(set(zip(df.index.year, df.index.month)))
+    years = sorted(set(df.index.year))
 
-    for yr, mo in periods:
+    for yr in years:
         if yr < start_year:
             continue
 
-        # Target window: the calendar month
-        month_mask = (df.index.year == yr) & (df.index.month == mo)
-        month_df   = df[month_mask]
+        # Target window: the calendar year
+        year_mask = df.index.year == yr
+        year_df   = df[year_mask]
 
-        if len(month_df) < 10:          # skip very short months
+        if len(year_df) < 50:          # skip very short years
             continue
 
-        # Warm-up window: up to WARMUP_DAYS trading days before the month starts
-        month_start = month_df.index[0]
-        pre_mask    = df.index < month_start
-        pre_df      = df[pre_mask].iloc[-WARMUP_DAYS:]
+        # Warm-up window: up to WARMUP_DAYS trading days before the year starts
+        year_start = year_df.index[0]
+        pre_mask   = df.index < year_start
+        pre_df     = df[pre_mask].iloc[-WARMUP_DAYS:]
 
-        combined = pd.concat([pre_df, month_df])
+        combined = pd.concat([pre_df, year_df])
 
         # Tag the boundary so evaluate_shard can strip the buffer
-        combined.attrs["eval_start"] = month_start
-        key = f"{yr}-{mo:02d}"
-        shards[key] = combined
+        combined.attrs["eval_start"] = year_start
+        shards[str(yr)] = combined
 
     return shards
-
 
 def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
     """Return only the bars from eval_start onward."""
