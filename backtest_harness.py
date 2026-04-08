@@ -212,48 +212,50 @@ def load_strategy(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# LLM — HuggingFace open-source (Qwen / Gemma), 4-bit quantised
+# LLM — HuggingFace open-source (Qwen / Gemma)
 # ---------------------------------------------------------------------------
 
 def build_llm_pipeline(model_id: str, device: str):
     """
-    Load a 4-bit NF4 quantised instruct model via HuggingFace Transformers.
-    Works on Colab A100 / L4 with bitsandbytes.
+    Load an instruct model via HuggingFace Transformers.
 
-    Recommended model IDs:
-      Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4   (A100, best reasoning)
-      Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4   (L4, good balance)
-      google/gemma-3-27b-it                   (alternative)
+    For GPTQ models (names contain 'GPTQ' or 'Int4'):
+      - The model is ALREADY quantized — never pass BitsAndBytesConfig.
+      - Requires: pip install optimum auto-gptq
+      - Works on Colab T4 / A100 directly.
+
+    For non-quantized models (e.g. google/gemma-3-27b-it):
+      - Loaded in bfloat16 directly — no extra quantization needed on GPU.
+
+    Recommended model IDs for Colab free T4 (16 GB VRAM):
+      Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4    ← safest fit on free T4
+      Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4   ← fits if VRAM is clean
+      Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4   ← Colab Pro / A100 only
     """
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-        pipeline,
-    )
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
     import torch
 
     print(f"[llm] Loading {model_id} on {device} ...")
 
-    quant_cfg = None
-    if device == "cuda":
-        quant_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    # GPTQ models carry their own quantization config — load as-is.
+    # Non-GPTQ models: load in bfloat16 to save VRAM without bitsandbytes.
+    is_gptq = any(tag in model_id for tag in ("GPTQ", "gptq", "Int4", "int4", "Int8", "int8"))
 
     model_kwargs: dict = dict(
         trust_remote_code=True,
-        device_map="auto" if device == "cuda" else None,
+        device_map="auto",          # lets HF place layers across GPU/CPU automatically
     )
-    if quant_cfg:
-        model_kwargs["quantization_config"] = quant_cfg
+    if not is_gptq:
+        # For plain instruct models load in bfloat16 — no quantization config needed
+        model_kwargs["torch_dtype"] = torch.bfloat16
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+    model.eval()
 
     pipe = pipeline(
         "text-generation",
@@ -264,7 +266,9 @@ def build_llm_pipeline(model_id: str, device: str):
         do_sample=True,
         return_full_text=False,
     )
-    print("[llm] Model loaded.")
+    print(f"[llm] Model loaded. VRAM used: "
+          f"{torch.cuda.memory_allocated() / 1024**3:.1f} GB / "
+          f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB total")
     return pipe
 
 
