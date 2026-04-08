@@ -4,9 +4,8 @@ backtest_harness.py  —  AutoFin Evaluation Engine & LLM Orchestration
 THIS FILE IS READ-ONLY TO THE LLM.
 
 Changes vs v1:
-  - Shards are now MONTHLY (keyed "YYYY-MM") instead of yearly.
-    Each iteration completes in seconds rather than minutes.
-  - Every shard gets a 100-day warm-up buffer prepended so that
+  - Shards are now YEARLY (keyed "YYYY") instead of monthly.
+    Each shard gets a 100-day warm-up buffer prepended so that
     Ichimoku / ATR / VWAP are fully initialised on the very first
     bar of the evaluation window. The buffer rows are stripped before
     any metrics are calculated — no look-ahead, no contamination.
@@ -15,6 +14,7 @@ Changes vs v1:
     we let the mutated code stand so the LLM can keep searching.
   - The LLM is now shown its failed strategy alongside the current best
     so it learns what NOT to repeat.
+  - Full verbose logging to verbose.log for every stage of the pipeline.
 
 Usage:
     python backtest_harness.py --ticker "^GSPC" --device cuda --forever
@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import torch
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 warnings.filterwarnings("ignore")
 
@@ -55,10 +56,24 @@ BEST_FILE     = ROOT / "best_strategy.py"
 LOG_FILE      = ROOT / "autofin_log.jsonl"
 RESULTS_TSV   = ROOT / "results.tsv"
 TRIGGER_FILE  = ROOT / "push_trigger.json"
+VERBOSE_LOG   = ROOT / "verbose.log"
 
 # How many calendar days of history to prepend to each shard so that
 # slow indicators (Ichimoku span_b needs 52+26 = 78 bars) are warm.
 WARMUP_DAYS = 100
+
+# ---------------------------------------------------------------------------
+# Verbose logger
+# ---------------------------------------------------------------------------
+
+def vlog(tag: str, content: str) -> None:
+    """Write a timestamped verbose entry to verbose.log and print it."""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    separator = "=" * 70
+    entry = f"\n{separator}\n[{timestamp}] [{tag}]\n{separator}\n{content}\n"
+    with open(VERBOSE_LOG, "a") as fh:
+        fh.write(entry)
+    print(entry)
 
 # ---------------------------------------------------------------------------
 # TSV results log
@@ -70,7 +85,7 @@ TSV_HEADER = "iteration\taggregate_score\tstatus\tdescription\tparams_snapshot\n
 def init_results_tsv() -> None:
     if not RESULTS_TSV.exists():
         RESULTS_TSV.write_text(TSV_HEADER)
-        print(f"[log] Initialised {RESULTS_TSV}")
+        vlog("INIT", f"Initialised {RESULTS_TSV}")
 
 
 def append_results_tsv(
@@ -93,7 +108,7 @@ def append_results_tsv(
 
 def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     """Download daily OHLCV data from Yahoo Finance."""
-    print(f"[data] Downloading {ticker}  {start} → {end} ...")
+    vlog("DATA DOWNLOAD", f"Ticker: {ticker}  Range: {start} → {end}")
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -102,15 +117,23 @@ def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
-    print(f"[data] {len(df)} rows loaded.")
+
+    vlog("DATA LOADED",
+        f"Rows     : {len(df)}\n"
+        f"From     : {df.index[0].date()}\n"
+        f"To       : {df.index[-1].date()}\n"
+        f"Columns  : {list(df.columns)}\n\n"
+        f"Head:\n{df.head(3).to_string()}\n\n"
+        f"Tail:\n{df.tail(3).to_string()}"
+    )
     return df
 
 
 # ---------------------------------------------------------------------------
-# Monthly sharding with warm-up buffer
+# Yearly sharding with warm-up buffer
 # ---------------------------------------------------------------------------
 
-def make_shards(df: pd.DataFrame, start_year: int = 2016) -> dict[str, pd.DataFrame]:
+def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFrame]:
     """
     Split DataFrame into YEARLY shards keyed as "YYYY".
 
@@ -122,32 +145,39 @@ def make_shards(df: pd.DataFrame, start_year: int = 2016) -> dict[str, pd.DataFr
     Shards with fewer than 50 bars in the target year are skipped.
     """
     shards: dict[str, pd.DataFrame] = {}
-
     years = sorted(set(df.index.year))
 
     for yr in years:
         if yr < start_year:
             continue
 
-        # Target window: the calendar year
         year_mask = df.index.year == yr
         year_df   = df[year_mask]
 
-        if len(year_df) < 50:          # skip very short years
+        if len(year_df) < 50:
+            vlog("SHARD SKIP", f"Year {yr} has only {len(year_df)} bars — skipping.")
             continue
 
-        # Warm-up window: up to WARMUP_DAYS trading days before the year starts
         year_start = year_df.index[0]
         pre_mask   = df.index < year_start
         pre_df     = df[pre_mask].iloc[-WARMUP_DAYS:]
 
         combined = pd.concat([pre_df, year_df])
-
-        # Tag the boundary so evaluate_shard can strip the buffer
         combined.attrs["eval_start"] = year_start
         shards[str(yr)] = combined
 
+    vlog("SHARDS CREATED",
+        f"start_year : {start_year}\n"
+        f"Shard keys : {list(shards.keys())}\n" +
+        "\n".join(
+            f"  {k}: {len(v)} total rows  "
+            f"(warmup={len(v) - (v.index >= v.attrs['eval_start']).sum()}  "
+            f"eval={(v.index >= v.attrs['eval_start']).sum()})"
+            for k, v in shards.items()
+        )
+    )
     return shards
+
 
 def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
     """Return only the bars from eval_start onward."""
@@ -204,7 +234,7 @@ def composite_score(sharpe: float, pf: float, mdd: float) -> float:
     return round(sharpe * 0.6 + pf * 0.2 - mdd * 0.2, 6)
 
 
-def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
+def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> dict:
     """
     Run strategy on one shard (which includes a warm-up buffer) and return
     metrics computed only over the target evaluation window.
@@ -212,27 +242,33 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
     eval_start = shard.attrs.get("eval_start", shard.index[0])
 
     try:
-        # Run indicators over the FULL shard (including warm-up) so they
-        # are initialised by the time we reach the evaluation window.
         signals = generate_signals_fn(shard)
         trades  = simulate_trades(shard, signals)
 
-        # Strip warm-up rows before scoring
         dr_full = trades["daily_return"]
         dr      = strip_warmup(dr_full, eval_start)
 
         if len(dr) == 0:
-            return _empty_result(shard, "no eval bars after warm-up strip")
+            result = _empty_result(shard, "no eval bars after warm-up strip")
+            vlog(f"SHARD EVAL [{shard_key}]",
+                f"eval_start : {eval_start.date()}\n"
+                f"Result     : EMPTY — no bars after warmup strip\n"
+                f"Raw result : {json.dumps(result, indent=2)}"
+            )
+            return result
 
         sh   = sharpe_ratio(dr)
         pf_  = profit_factor(dr)
         mdd  = max_drawdown(dr)
         sc   = composite_score(sh, pf_, mdd)
 
-        sig_eval  = strip_warmup(signals["signal"], eval_start)
-        n_trades  = int((sig_eval.diff().abs() > 0).sum())
+        sig_eval = strip_warmup(signals["signal"], eval_start)
+        n_trades = int((sig_eval.diff().abs() > 0).sum())
 
-        return {
+        # Signal distribution for debugging
+        sig_counts = sig_eval.value_counts().to_dict()
+
+        result = {
             "sharpe":        round(sh,  4),
             "profit_factor": round(pf_, 4),
             "max_drawdown":  round(mdd, 4),
@@ -241,13 +277,32 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
             "n_bars":        len(dr),
             "error":         None,
         }
+
+        vlog(f"SHARD EVAL [{shard_key}]",
+            f"eval_start    : {eval_start.date()}\n"
+            f"eval_bars     : {len(dr)}\n"
+            f"n_trades      : {n_trades}\n"
+            f"signal_counts : {sig_counts}\n"
+            f"sharpe        : {sh:.4f}\n"
+            f"profit_factor : {pf_:.4f}\n"
+            f"max_drawdown  : {mdd:.4f}\n"
+            f"score         : {sc:.6f}\n"
+            f"daily_ret sample (first 5):\n{dr.head().to_string()}"
+        )
+        return result
+
     except Exception as exc:
-        return {
+        result = {
             "sharpe": 0.0, "profit_factor": 0.0,
             "max_drawdown": 1.0, "score": -99.0,
             "n_trades": 0, "n_bars": len(shard),
             "error": str(exc),
         }
+        vlog(f"SHARD EVAL ERROR [{shard_key}]",
+            f"Exception : {exc}\n\n"
+            f"{traceback.format_exc()}"
+        )
+        return result
 
 
 def _empty_result(shard: pd.DataFrame, reason: str) -> dict:
@@ -271,8 +326,30 @@ def load_strategy(path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Contract validator
+# ---------------------------------------------------------------------------
+
+def validate_syntax(code: str) -> tuple[bool, str]:
+    try:
+        compile(code, "<strategy>", "exec")
+        return True, ""
+    except SyntaxError as exc:
+        return False, str(exc)
+
+
+def validate_strategy_contract(code: str) -> tuple[bool, str]:
+    """Check that the code actually defines generate_signals and get_params."""
+    if "def generate_signals" not in code:
+        return False, "missing generate_signals function"
+    if "def get_params" not in code:
+        return False, "missing get_params function"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # LLM pipeline
 # ---------------------------------------------------------------------------
+
 def build_llm_pipeline(model_id: str, device: str):
     from transformers import (
         AutoModelForCausalLM,
@@ -280,9 +357,8 @@ def build_llm_pipeline(model_id: str, device: str):
         BitsAndBytesConfig,
         pipeline,
     )
-    import torch
 
-    print(f"[llm] Loading {model_id} on {device} ...")
+    vlog("LLM LOADING", f"Model : {model_id}\nDevice: {device}")
 
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -309,7 +385,14 @@ def build_llm_pipeline(model_id: str, device: str):
         do_sample=True,
         return_full_text=False,
     )
-    print("[llm] Model loaded.")
+
+    vlog("LLM LOADED",
+        f"Model          : {model_id}\n"
+        f"Quantization   : 4-bit NF4 double-quant\n"
+        f"max_new_tokens : 2048\n"
+        f"temperature    : 0.3\n"
+        f"VRAM after load:\n{torch.cuda.memory_summary(abbreviated=True)}"
+    )
     return pipe
 
 
@@ -327,12 +410,7 @@ def build_prompt(
     last_failed_source: Optional[str] = None,
     last_failed_score:  Optional[float] = None,
 ) -> list[dict]:
-    """
-    Build the chat-format messages list for the LLM.
 
-    Now includes the failed strategy code (if any) so the LLM knows
-    exactly what it tried last and why it didn't improve.
-    """
     # ---- Per-shard results table ----
     rows = []
     for key, m in shard_results.items():
@@ -371,7 +449,7 @@ def build_prompt(
             "Do NOT write anything outside these two tags."
         )
 
-    # ---- Failure context block (the key fix for Trap 2) ----
+    # ---- Failure context block ----
     failure_block = ""
     if last_failed_source is not None:
         failure_block = (
@@ -382,13 +460,19 @@ def build_prompt(
             f"--- END OF LAST ATTEMPT ---\n"
         )
 
+    # Truncate strategy source to avoid blowing context window on small models
+    MAX_STRATEGY_CHARS = 3000
+    strategy_display = strategy_source
+    if len(strategy_source) > MAX_STRATEGY_CHARS:
+        strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + "\n# ... (truncated for context)"
+
     user_content = (
         f"=== ITERATION {iteration} ===\n\n"
         f"--- Per-shard results (current best strategy) ---\n{shard_table}\n\n"
         f"--- Aggregate score: {aggregate_score:.5f} ---\n\n"
         f"--- Score history (last 5) ---\n{hist_str}\n\n"
         f"{failure_block}"
-        f"--- Current BEST strategy.py ---\n{strategy_source}\n\n"
+        f"--- Current BEST strategy.py ---\n{strategy_display}\n\n"
         f"{task_line}"
     )
 
@@ -409,12 +493,12 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
     reasoning = r_match.group(1).strip() if r_match else None
     strategy  = s_match.group(1).strip() if s_match else None
 
-    # Fallback: if no <strategy> tag, grab the largest ```python``` block
+    # Fallback: grab the largest ```python``` block
     if not strategy:
         blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
         if blocks:
             strategy = max(blocks, key=len).strip()
-            print("[parse] No <strategy> tag — fell back to largest ```python``` block")
+            vlog("PARSE FALLBACK", "No <strategy> tag found — fell back to largest ```python``` block")
 
     if strategy:
         strategy = re.sub(r"^```[a-zA-Z]*\n?", "", strategy)
@@ -422,13 +506,6 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
         strategy = strategy.strip()
 
     return reasoning, strategy
-
-def validate_syntax(code: str) -> tuple[bool, str]:
-    try:
-        compile(code, "<strategy>", "exec")
-        return True, ""
-    except SyntaxError as exc:
-        return False, str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +518,7 @@ def log_jsonl(record: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GitHub MCP trigger
+# GitHub push trigger
 # ---------------------------------------------------------------------------
 
 def write_trigger(score: float, iteration: int, params: dict) -> None:
@@ -452,7 +529,7 @@ def write_trigger(score: float, iteration: int, params: dict) -> None:
         "timestamp": datetime.utcnow().isoformat(),
     }
     TRIGGER_FILE.write_text(json.dumps(payload, indent=2))
-    print(f"[trigger] push_trigger.json updated (score={score:.5f})")
+    vlog("TRIGGER WRITTEN", f"push_trigger.json updated\n{json.dumps(payload, indent=2)}")
 
 
 # ---------------------------------------------------------------------------
@@ -474,27 +551,40 @@ def run(
     init_results_tsv()
 
     program_source = PROGRAM_FILE.read_text()
-    print(f"[init] Loaded program.md ({len(program_source)} chars)")
+    vlog("INIT",
+        f"ticker     : {ticker}\n"
+        f"start      : {start}\n"
+        f"end        : {end}\n"
+        f"model      : {model_id}\n"
+        f"device     : {device}\n"
+        f"iterations : {iterations}\n"
+        f"forever    : {forever}\n"
+        f"patience   : {patience}\n"
+        f"start_year : {start_year}\n"
+        f"program.md : {len(program_source)} chars"
+    )
 
     df     = download_data(ticker, start, end)
     shards = make_shards(df, start_year=start_year)
-    print(f"[data] Monthly shards: {list(shards.keys())}")
 
     pipe = build_llm_pipeline(model_id, device)
 
-    best_score         = -math.inf
-    no_improve         = 0
+    best_score          = -math.inf
+    no_improve          = 0
     history: list[dict] = []
-    iteration          = 0
-
-    # Track the last failed attempt so the LLM can learn from it
-    last_failed_source: Optional[str] = None
+    iteration           = 0
+    last_failed_source: Optional[str]  = None
     last_failed_score:  Optional[float] = None
+
+    # Stale-detection: skip LLM call if metrics are identical for N iterations
+    last_shard_metrics = None
+    stale_count        = 0
+    MAX_STALE          = 3
 
     while True:
         iteration += 1
         if not forever and iteration > iterations:
-            print("[loop] Max iterations reached.")
+            vlog("LOOP END", "Max iterations reached.")
             break
 
         print(f"\n{'='*62}")
@@ -506,20 +596,28 @@ def run(
             strat               = load_strategy(STRATEGY_FILE)
             generate_signals_fn = strat.generate_signals
             current_params      = strat.get_params()
+            vlog("STRATEGY LOADED",
+                f"Iteration : {iteration}\n"
+                f"Params    :\n{json.dumps(current_params, indent=2)}\n\n"
+                f"Source ({len(STRATEGY_FILE.read_text())} chars):\n{STRATEGY_FILE.read_text()}"
+            )
         except Exception as exc:
-            print(f"[strategy] CRASH loading strategy.py: {exc}")
-            traceback.print_exc()
+            vlog("STRATEGY CRASH",
+                f"Failed to load strategy.py\n"
+                f"Exception : {exc}\n\n"
+                f"{traceback.format_exc()}"
+            )
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
-                print("[strategy] Rolled back to best_strategy.py")
+                vlog("ROLLBACK", "Rolled back to best_strategy.py after load crash.")
             append_results_tsv(iteration, 0.0, "crash", f"load error: {exc}", {})
             continue
 
-        # ---- Evaluate on all monthly shards ----
+        # ---- Evaluate on all yearly shards ----
         shard_results: dict[str, dict] = {}
         any_crash = False
         for key, shard_df in shards.items():
-            m = evaluate_shard(shard_df, generate_signals_fn)
+            m = evaluate_shard(shard_df, generate_signals_fn, key)
             shard_results[key] = m
             if m["error"] and m["score"] == -99.0:
                 any_crash = True
@@ -535,6 +633,22 @@ def run(
         aggregate    = float(np.mean(valid_scores)) if valid_scores else -99.0
         print(f"\n  ► Aggregate: {aggregate:.5f}   Best so far: {best_score:.5f}")
 
+        # ---- Stale detection ----
+        current_metrics = {k: v["score"] for k, v in shard_results.items()}
+        if last_shard_metrics is not None and current_metrics == last_shard_metrics:
+            stale_count += 1
+            vlog("STALE DETECTION",
+                f"Metrics identical for {stale_count}/{MAX_STALE} consecutive iterations.\n"
+                f"Scores: {current_metrics}"
+            )
+            if stale_count >= MAX_STALE:
+                vlog("STALE SKIP", f"Skipping LLM call — metrics flat for {MAX_STALE} iterations.")
+                last_shard_metrics = current_metrics
+                # Still need to determine status and log before continuing
+        else:
+            stale_count = 0
+        last_shard_metrics = current_metrics
+
         # ---- Determine status ----
         if any_crash and not valid_scores:
             status      = "crash"
@@ -543,13 +657,24 @@ def run(
             status      = "keep" if iteration > 1 else "baseline"
             description = f"iter {iteration}: aggregate={aggregate:.5f}"
         elif aggregate == best_score:
-            # Exploration: score didn't improve but didn't regress either.
-            # Let the mutated code stand so the LLM can keep wandering.
             status      = "explore"
             description = f"iter {iteration}: flat ({aggregate:.5f}), keeping for exploration"
         else:
             status      = "discard" if iteration > 1 else "baseline"
             description = f"iter {iteration}: regression ({aggregate:.5f} < {best_score:.5f})"
+
+        vlog("AGGREGATE",
+            f"Iteration      : {iteration}\n"
+            f"Aggregate      : {aggregate:.6f}\n"
+            f"Best so far    : {best_score:.6f}\n"
+            f"Status         : {status}\n"
+            f"Description    : {description}\n"
+            f"no_improve     : {no_improve}/{patience}\n"
+            f"stale_count    : {stale_count}/{MAX_STALE}\n"
+            f"any_crash      : {any_crash}\n"
+            f"valid_shards   : {len(valid_scores)}/{len(shard_results)}\n"
+            f"All scores     : {json.dumps(current_metrics, indent=2)}"
+        )
 
         # ---- Log ----
         record = {
@@ -566,40 +691,51 @@ def run(
 
         # ---- Advance or roll back ----
         if aggregate > best_score:
-            best_score          = aggregate
-            no_improve          = 0
-            last_failed_source  = None
-            last_failed_score   = None
+            best_score         = aggregate
+            no_improve         = 0
+            last_failed_source = None
+            last_failed_score  = None
             shutil.copy(STRATEGY_FILE, BEST_FILE)
-            print(f"  ★ New best! Saved to best_strategy.py")
+            vlog("NEW BEST",
+                f"Score improved : {best_score:.6f} (was -inf or lower)\n"
+                f"Saved best_strategy.py"
+            )
             write_trigger(best_score, iteration, current_params)
 
         elif aggregate == best_score:
-            # Exploration mode — do NOT roll back. The LLM keeps its mutated code.
             no_improve += 1
-            print(f"  ~ Exploration move kept (no_improve={no_improve}/{patience})")
-            # No failure to report — the code is still live
+            vlog("EXPLORE",
+                f"Score flat at {aggregate:.6f} — keeping mutated code for exploration.\n"
+                f"no_improve: {no_improve}/{patience}"
+            )
             last_failed_source = None
             last_failed_score  = None
 
         else:
-            # Regression — roll back and remember what failed
-            no_improve         += 1
-            last_failed_source  = STRATEGY_FILE.read_text()
-            last_failed_score   = aggregate
+            no_improve        += 1
+            last_failed_source = STRATEGY_FILE.read_text()
+            last_failed_score  = aggregate
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
-                print(f"  ✗ Regression: rolled back to best_strategy.py  (no_improve={no_improve}/{patience})")
+                vlog("ROLLBACK",
+                    f"Regression: {aggregate:.6f} < {best_score:.6f}\n"
+                    f"Rolled back strategy.py to best_strategy.py\n"
+                    f"no_improve: {no_improve}/{patience}\n\n"
+                    f"--- FAILED STRATEGY ---\n{last_failed_source}"
+                )
             else:
-                print(f"  ✗ Regression, no best file yet — keeping current code.")
+                vlog("ROLLBACK SKIPPED", "No best_strategy.py exists yet — keeping current code.")
 
         if no_improve >= patience and not forever:
-            print("[loop] Plateau reached. Stopping.")
+            vlog("PLATEAU", f"no_improve={no_improve} >= patience={patience}. Stopping.")
             break
 
-        # ---- Call LLM for next proposal ----
-        # Re-read strategy AFTER potential rollback so the LLM always sees
-        # the current best. The failed attempt is passed separately.
+        # Skip LLM call if metrics have been stale too long
+        if stale_count >= MAX_STALE:
+            vlog("STALE SKIP LLM", "Skipping LLM generation this iteration due to flat metrics.")
+            continue
+
+        # ---- Build prompt ----
         strategy_source = STRATEGY_FILE.read_text()
 
         messages = build_prompt(
@@ -613,47 +749,119 @@ def run(
             last_failed_score  = last_failed_score,
         )
 
+        vlog("LLM PROMPT",
+            f"Turns : {len(messages)}\n\n" +
+            "\n" + "-"*50 + "\n".join(
+                f"[{m['role'].upper()}]\n{m['content']}"
+                for m in messages
+            )
+        )
+
+        # ---- Generate ----
         torch.cuda.empty_cache()
+        vlog("VRAM BEFORE GENERATION", torch.cuda.memory_summary(abbreviated=True))
         print("\n[llm] Generating next strategy ...")
+
         try:
-            formatted  = pipe.tokenizer.apply_chat_template(
+            formatted = pipe.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
+            estimated_tokens = len(formatted) // 4
+            vlog("LLM INPUT",
+                f"Formatted prompt length : {len(formatted)} chars\n"
+                f"Estimated tokens        : ~{estimated_tokens}\n\n"
+                f"--- FORMATTED PROMPT (first 3000 chars) ---\n{formatted[:3000]}"
+            )
+
             outputs    = pipe(formatted)
             llm_output = outputs[0]["generated_text"]
-        except Exception as exc:
-            print(f"[llm] Generation failed: {exc}")
-            traceback.print_exc()
+
+            vlog("LLM RAW OUTPUT",
+                f"Length : {len(llm_output)} chars\n\n"
+                f"--- FULL OUTPUT ---\n{llm_output}"
+            )
+
+        except torch.cuda.OutOfMemoryError as exc:
+            vlog("OOM ERROR",
+                f"CUDA OOM during generation.\n"
+                f"Exception : {exc}\n\n"
+                f"Memory summary:\n{torch.cuda.memory_summary()}"
+            )
+            torch.cuda.empty_cache()
             continue
 
+        except Exception as exc:
+            vlog("GENERATION ERROR",
+                f"Exception : {exc}\n\n"
+                f"{traceback.format_exc()}"
+            )
+            continue
+
+        # ---- Parse ----
         reasoning, new_strategy = parse_llm_response(llm_output)
+
+        vlog("LLM PARSED",
+            f"Reasoning found  : {reasoning is not None}\n"
+            f"Strategy found   : {new_strategy is not None}\n\n"
+            f"--- REASONING ---\n{reasoning or '(none)'}\n\n"
+            f"--- EXTRACTED STRATEGY ({len(new_strategy) if new_strategy else 0} chars) ---\n"
+            f"{new_strategy or '(none)'}"
+        )
 
         if reasoning:
             print(f"\n[llm] Reasoning: {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}\n")
 
         if not new_strategy:
+            vlog("PARSE FAILED", "No strategy block found in LLM output. Re-running current best.")
             print("[parse] No <strategy> block found. Re-running current best next iteration.")
             continue
 
-        syntax_ok, syntax_err = validate_syntax(new_strategy)
+        # ---- Validate ----
+        syntax_ok, syntax_err     = validate_syntax(new_strategy)
+        contract_ok, contract_err = validate_strategy_contract(new_strategy)
+
+        vlog("VALIDATION",
+            f"Syntax OK       : {syntax_ok}\n"
+            f"Syntax error    : {syntax_err or 'none'}\n"
+            f"Contract OK     : {contract_ok}\n"
+            f"Contract error  : {contract_err or 'none'}"
+        )
+
         if not syntax_ok:
             print(f"[parse] Syntax error — keeping current best. Error: {syntax_err}")
-            append_results_tsv(
-                iteration + 1, 0.0, "crash",
-                f"syntax error: {syntax_err[:80]}", {}
-            )
+            append_results_tsv(iteration + 1, 0.0, "crash", f"syntax error: {syntax_err[:80]}", {})
             continue
 
+        if not contract_ok:
+            print(f"[parse] Contract error — {contract_err}. Keeping current best.")
+            append_results_tsv(iteration + 1, 0.0, "crash", f"contract error: {contract_err}", {})
+            continue
+
+        # ---- Write ----
         STRATEGY_FILE.write_text(new_strategy)
+        vlog("STRATEGY WRITTEN",
+            f"Written to : {STRATEGY_FILE}\n"
+            f"Length     : {len(new_strategy)} chars\n\n"
+            f"--- CONTENT ---\n{new_strategy}"
+        )
         print("[strategy] strategy.py updated for next iteration.")
 
     # ---- Final summary ----
+    vlog("RUN COMPLETE",
+        f"Best aggregate score : {best_score:.5f}\n"
+        f"Best strategy        : {BEST_FILE}\n"
+        f"Results table        : {RESULTS_TSV}\n"
+        f"Full JSONL log       : {LOG_FILE}\n"
+        f"Verbose log          : {VERBOSE_LOG}\n"
+        f"Total iterations     : {iteration}"
+    )
     print(f"\n{'='*62}")
     print(f"  AutoFin complete.")
     print(f"  Best aggregate score : {best_score:.5f}")
     print(f"  Best strategy        : {BEST_FILE}")
     print(f"  Results table        : {RESULTS_TSV}")
     print(f"  Full JSONL log       : {LOG_FILE}")
+    print(f"  Verbose log          : {VERBOSE_LOG}")
     print(f"{'='*62}")
 
 
@@ -674,12 +882,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end",        default="2024-12-31")
     p.add_argument(
         "--model",
-        default="Qwen/Qwen2.5-32B-Instruct",
+        default="Qwen/Qwen2.5-7B-Instruct",
         help=(
             "HuggingFace model ID.\n"
             "  Qwen/Qwen2.5-72B-Instruct  (A100 — best)\n"
-            "  Qwen/Qwen2.5-32B-Instruct  (L4  — default)\n"
-            "  Qwen/Qwen2.5-7B-Instruct   (smaller GPU, faster)\n"
+            "  Qwen/Qwen2.5-32B-Instruct  (L4  — good)\n"
+            "  Qwen/Qwen2.5-7B-Instruct   (T4  — default)\n"
             "  google/gemma-3-27b-it       (alternative)"
         ),
     )
