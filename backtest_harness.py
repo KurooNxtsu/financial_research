@@ -348,13 +348,19 @@ def build_prompt(
     if iteration == 1:
         task_line = (
             "This is iteration 1 — the BASELINE run. "
-            "Output the current strategy.py UNCHANGED so we can record the baseline score."
+            "Output the current strategy.py UNCHANGED.\n\n"
+            "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
+            "<reasoning>\nBaseline run, no changes.\n</reasoning>\n"
+            "<strategy>\n# paste strategy here unchanged\n</strategy>"
         )
     else:
         task_line = (
             f"The CURRENT BEST aggregate score is {aggregate_score:.5f}. "
-            "Propose an improved strategy.py. Be hypothesis-driven. "
-            "Reference the weakest monthly shards in your reasoning."
+            "Propose an improved strategy.py.\n\n"
+            "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
+            "<reasoning>\nYour analysis here\n</reasoning>\n"
+            "<strategy>\n# full python code here\n</strategy>\n\n"
+            "Do NOT write anything outside these two tags."
         )
 
     # ---- Failure context block (the key fix for Trap 2) ----
@@ -395,13 +401,19 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
     reasoning = r_match.group(1).strip() if r_match else None
     strategy  = s_match.group(1).strip() if s_match else None
 
+    # Fallback: if no <strategy> tag, grab the largest ```python``` block
+    if not strategy:
+        blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+        if blocks:
+            strategy = max(blocks, key=len).strip()
+            print("[parse] No <strategy> tag — fell back to largest ```python``` block")
+
     if strategy:
         strategy = re.sub(r"^```[a-zA-Z]*\n?", "", strategy)
         strategy = re.sub(r"\n?```$",           "", strategy)
         strategy = strategy.strip()
 
     return reasoning, strategy
-
 
 def validate_syntax(code: str) -> tuple[bool, str]:
     try:
