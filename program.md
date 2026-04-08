@@ -78,6 +78,12 @@ Returns a DataFrame with columns:
 - **Short bias**: `bearish == True` (price below cloud)
 - Defaults: `conversion_period=9, base_period=26, lagging_span2_period=52, displacement=26`
 
+> **Warm-up note**: the full Ichimoku cloud (senkou_span_b) requires
+> `lagging_span2_period + displacement` bars to initialise — 78 bars at defaults.
+> The harness prepends a 100-day warm-up buffer to every monthly shard so your
+> indicators are fully ready from the first bar of the evaluation window.
+> You do not need to handle this yourself.
+
 ### 2. `rsi` — Momentum Filter
 
 ```python
@@ -124,6 +130,12 @@ SHORT entry : ichimoku bearish  AND  rsi sell_signal  AND  price < vwap
 SHORT exit  : rsi buy_signal    OR   price rises above atr short_stop
 ```
 
+The default entry condition is intentionally strict (a "perfect storm" of three
+simultaneous signals). If you are seeing zero trades on most shards, **loosen at
+least one condition** — for example, drop the VWAP filter, or replace the RSI
+crossover signal with a zone check (`rsi_value < oversold` rather than a single
+crossover bar).
+
 ---
 
 ## Evaluation Metric (fixed — lives in backtest_harness.py, do not try to change it)
@@ -138,23 +150,31 @@ score = Sharpe_Ratio × 0.6  +  Profit_Factor × 0.2  −  Max_Drawdown × 0.2
 - `Sharpe_Ratio` is annualised (252 trading days, risk-free rate = 0).
 
 The **aggregate score** is the mean across all valid shards. Do NOT sacrifice
-out-of-sample performance (2023, 2024) for in-sample gains — watch both.
+out-of-sample performance (2023, 2024 shards) for in-sample gains — watch both.
 
 ---
 
 ## Data Shards
 
-Daily OHLCV data (S&P 500 or NASDAQ-100), sliced into year-wide windows:
+Shards are **monthly** windows (keyed `"YYYY-MM"`), covering every calendar month
+from `start_year` through the end of the data. Each shard has a 100-day warm-up
+buffer prepended by the harness — you never see cold indicators.
 
-| Shard | Period | Character |
-|---|---|---|
-| 2018 | 2018-01-01 → 2018-12-31 | In-sample — late bull / Q4 crash |
-| 2019 | 2019-01-01 → 2019-12-31 | In-sample — recovery bull run |
-| 2020 | 2020-01-01 → 2020-12-31 | In-sample — COVID crash + V-recovery |
-| 2021 | 2021-01-01 → 2021-12-31 | In-sample — strong bull market |
-| 2022 | 2022-01-01 → 2022-12-31 | In-sample — inflation bear market |
-| 2023 | 2023-01-01 → 2023-12-31 | **Out-of-sample** |
-| 2024 | 2024-01-01 → present | **Out-of-sample (most recent)** |
+Example shard keys: `2018-01`, `2018-02`, ..., `2024-12`
+
+| Period | Character |
+|---|---|
+| 2018 | In-sample — late bull / Q4 crash |
+| 2019 | In-sample — recovery bull run |
+| 2020 | In-sample — COVID crash + V-recovery |
+| 2021 | In-sample — strong bull market |
+| 2022 | In-sample — inflation bear market |
+| 2023 | **Out-of-sample** |
+| 2024 | **Out-of-sample (most recent)** |
+
+Because shards are monthly (~21 trading bars each), a strategy that generates
+zero trades in a month scores 0.0 for that shard. Watch the `Trades` column in
+the results table — if most shards show 0, your entry conditions are too strict.
 
 ---
 
@@ -169,6 +189,25 @@ All else being equal, **simpler is better**.
 
 ---
 
+## Rollback and Exploration Rules
+
+The harness uses a three-way outcome system each iteration:
+
+| Outcome | Condition | Action |
+|---|---|---|
+| **keep** | `aggregate > best_score` | Save as new best, update trigger |
+| **explore** | `aggregate == best_score` | Keep the mutated code live — let the LLM keep searching |
+| **discard** | `aggregate < best_score` | Roll back to `best_strategy.py`; pass the failed code to the LLM |
+
+When a strategy is **discarded**, the harness sends you your failed code in the
+next prompt under the heading `YOUR LAST ATTEMPT`. Study it carefully — do NOT
+repeat the same change. Propose something meaningfully different.
+
+When in **explore** mode (flat score), your code is kept live. This lets you
+accumulate incremental improvements even when starting from 0.0.
+
+---
+
 ## The Experiment Loop
 
 **LOOP FOREVER:**
@@ -176,26 +215,28 @@ All else being equal, **simpler is better**.
 1. Read `program.md` (this file) and `strategy.py`.
 2. Examine the per-shard results table and aggregate score from the harness.
 3. Identify the weakest shards. Think about why: is the strategy over-trading in
-   volatile regimes? Are stops too tight in 2020? Are signals too rare in 2022?
-4. Propose a new `strategy.py` with a hypothesis-driven change.
-5. Respond in the required format (below).
-6. The harness will:
+   volatile regimes? Are stops too tight in the COVID crash months? Are signals
+   too rare in 2022?
+4. If you see a `YOUR LAST ATTEMPT` block, understand why it failed before
+   proposing a new approach.
+5. Propose a new `strategy.py` with a hypothesis-driven change.
+6. Respond in the required format (below).
+7. The harness will:
    - Execute the new `strategy.py`
-   - Score it on all shards
-   - **Advance** (keep) if aggregate score improved
-   - **Roll back** to previous best if not improved or if it crashes
-   - Log to `results.tsv` with status `keep`, `discard`, or `crash`
+   - Score it on all monthly shards
+   - **Keep** if aggregate improved, **Explore** if flat, **Discard** if worse
+   - Log to `results.tsv` with status `keep`, `explore`, `discard`, or `crash`
    - Feed you the results for the next iteration
 
 **The first iteration** always runs the **unmodified baseline** to establish a
 reference. Do not change anything on iteration 1 — just output the current
 `strategy.py` unchanged.
 
-**NEVER STOP**: Do not ask whether to continue. Do not pause for confirmation. The
-human may be asleep. Run until manually interrupted. If you exhaust obvious ideas,
-try: combining near-misses, relaxing entry conditions, adjusting the ATR multiplier
-for different market regimes, using the Ichimoku kijun/tenkan cross as a secondary
-signal, or asymmetric long/short thresholds.
+**NEVER STOP**: Do not ask whether to continue. Do not pause for confirmation.
+Run until manually interrupted. If you exhaust obvious ideas, try: relaxing the
+entry conditions one at a time, replacing RSI crossover with RSI zone checks,
+using the Ichimoku kijun/tenkan cross as a secondary signal, adjusting the ATR
+multiplier for different market regimes, or asymmetric long/short thresholds.
 
 ---
 
@@ -203,8 +244,8 @@ signal, or asymmetric long/short thresholds.
 
 - **Syntax error**: The harness rejects your code and re-runs the previous best.
   Fix the syntax in your next proposal.
-- **Zero trades**: If no signals trigger across a shard, the strategy is too
-  restrictive. Loosen at least one entry condition.
+- **Zero trades on most shards**: Your entry condition is too strict for a
+  monthly window (~21 bars). Drop or relax at least one filter.
 - **Profit_Factor = 10.0** (capped): The strategy may have no losing trades in
   that shard — check if ATR stop is unrealistically wide.
 - **Score = -99.0**: A runtime exception occurred. The harness logs the error; fix
@@ -220,8 +261,9 @@ Respond with **exactly two XML sections** and nothing else:
 <reasoning>
 Concise explanation (≤ 150 words) of what you changed and why, referencing:
   - The previous aggregate score
-  - Which shards were weakest and why you think so
+  - Which monthly shards were weakest and why you think so
   - What specifically you changed and the hypothesis
+  - (If applicable) Why your last attempt failed and what you are doing differently
 </reasoning>
 
 <strategy>

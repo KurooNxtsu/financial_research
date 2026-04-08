@@ -3,12 +3,18 @@ backtest_harness.py  —  AutoFin Evaluation Engine & LLM Orchestration
 =======================================================================
 THIS FILE IS READ-ONLY TO THE LLM.
 
-Analogous to prepare.py in AutoResearch:
-  - Fixed evaluation metric (composite_score) — do not modify.
-  - Data loading, sharding, trade simulation — do not modify.
-  - LLM orchestration loop — do not modify.
-
-The LLM only sees program.md and strategy.py. It never sees this file.
+Changes vs v1:
+  - Shards are now MONTHLY (keyed "YYYY-MM") instead of yearly.
+    Each iteration completes in seconds rather than minutes.
+  - Every shard gets a 100-day warm-up buffer prepended so that
+    Ichimoku / ATR / VWAP are fully initialised on the very first
+    bar of the evaluation window. The buffer rows are stripped before
+    any metrics are calculated — no look-ahead, no contamination.
+  - Rollback logic changed: we only roll back when aggregate < best_score.
+    When aggregate == best_score (both 0.0 while the agent is exploring)
+    we let the mutated code stand so the LLM can keep searching.
+  - The LLM is now shown its failed strategy alongside the current best
+    so it learns what NOT to repeat.
 
 Usage:
     python backtest_harness.py --ticker "^GSPC" --device cuda --forever
@@ -42,23 +48,25 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 
 ROOT          = Path(__file__).parent.resolve()
-PROGRAM_FILE  = ROOT / "program.md"          # LLM reads this
-STRATEGY_FILE = ROOT / "strategy.py"         # LLM writes this
-BEST_FILE     = ROOT / "best_strategy.py"    # snapshot of the best-ever strategy
-LOG_FILE      = ROOT / "autofin_log.jsonl"   # machine-readable full log
-RESULTS_TSV   = ROOT / "results.tsv"         # human-readable experiment table (untracked)
-TRIGGER_FILE  = ROOT / "push_trigger.json"   # watched by external GitHub MCP
+PROGRAM_FILE  = ROOT / "program.md"
+STRATEGY_FILE = ROOT / "strategy.py"
+BEST_FILE     = ROOT / "best_strategy.py"
+LOG_FILE      = ROOT / "autofin_log.jsonl"
+RESULTS_TSV   = ROOT / "results.tsv"
+TRIGGER_FILE  = ROOT / "push_trigger.json"
 
+# How many calendar days of history to prepend to each shard so that
+# slow indicators (Ichimoku span_b needs 52+26 = 78 bars) are warm.
+WARMUP_DAYS = 100
 
 # ---------------------------------------------------------------------------
-# TSV results log (mirrors AutoResearch's results.tsv)
+# TSV results log
 # ---------------------------------------------------------------------------
 
 TSV_HEADER = "iteration\taggregate_score\tstatus\tdescription\tparams_snapshot\n"
 
 
 def init_results_tsv() -> None:
-    """Create results.tsv with header if it doesn't exist."""
     if not RESULTS_TSV.exists():
         RESULTS_TSV.write_text(TSV_HEADER)
         print(f"[log] Initialised {RESULTS_TSV}")
@@ -67,11 +75,10 @@ def init_results_tsv() -> None:
 def append_results_tsv(
     iteration: int,
     score: float,
-    status: str,       # "keep" | "discard" | "crash" | "baseline"
+    status: str,
     description: str,
     params: dict,
 ) -> None:
-    """Append one row to results.tsv (tab-separated, no commas in description)."""
     params_str = json.dumps(params).replace("\t", " ")
     desc       = description.replace("\t", " ").replace("\n", " ")
     row = f"{iteration}\t{score:.6f}\t{status}\t{desc}\t{params_str}\n"
@@ -80,7 +87,7 @@ def append_results_tsv(
 
 
 # ---------------------------------------------------------------------------
-# Data loading & sharding
+# Data loading
 # ---------------------------------------------------------------------------
 
 def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -88,7 +95,6 @@ def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     print(f"[data] Downloading {ticker}  {start} → {end} ...")
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
 
-    # yfinance sometimes returns MultiIndex columns — flatten them
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
 
@@ -99,19 +105,55 @@ def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Monthly sharding with warm-up buffer
+# ---------------------------------------------------------------------------
+
 def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFrame]:
     """
-    Split DataFrame into year-wide shards (keyed by 'YYYY').
-    Shards with fewer than 20 bars are skipped (incomplete years).
+    Split DataFrame into MONTHLY shards keyed as "YYYY-MM".
+
+    Each shard value is the FULL slice including a WARMUP_DAYS-day history
+    buffer prepended before the target month. The evaluation functions must
+    call strip_warmup() on the trade/return series before computing metrics
+    so that warm-up bars are never scored.
+
+    Shards with fewer than 10 bars in the target month are skipped.
     """
     shards: dict[str, pd.DataFrame] = {}
-    for yr in sorted(df.index.year.unique()):
+
+    # All (year, month) pairs present in the data
+    periods = sorted(set(zip(df.index.year, df.index.month)))
+
+    for yr, mo in periods:
         if yr < start_year:
             continue
-        shard = df[df.index.year == yr].copy()
-        if len(shard) >= 20:
-            shards[str(yr)] = shard
+
+        # Target window: the calendar month
+        month_mask = (df.index.year == yr) & (df.index.month == mo)
+        month_df   = df[month_mask]
+
+        if len(month_df) < 10:          # skip very short months
+            continue
+
+        # Warm-up window: up to WARMUP_DAYS trading days before the month starts
+        month_start = month_df.index[0]
+        pre_mask    = df.index < month_start
+        pre_df      = df[pre_mask].iloc[-WARMUP_DAYS:]
+
+        combined = pd.concat([pre_df, month_df])
+
+        # Tag the boundary so evaluate_shard can strip the buffer
+        combined.attrs["eval_start"] = month_start
+        key = f"{yr}-{mo:02d}"
+        shards[key] = combined
+
     return shards
+
+
+def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
+    """Return only the bars from eval_start onward."""
+    return series[series.index >= eval_start]
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +161,6 @@ def make_shards(df: pd.DataFrame, start_year: int = 2018) -> dict[str, pd.DataFr
 # ---------------------------------------------------------------------------
 
 def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert a signal series into daily strategy returns.
-
-    Positions are determined at the close of the signal bar and executed on
-    the next bar (lag by 1) to avoid look-ahead bias.
-    """
     pos     = signals["signal"].shift(1).fillna(0)
     log_ret = np.log(df["Close"] / df["Close"].shift(1)).fillna(0)
     strat   = pos * log_ret
@@ -164,30 +200,47 @@ def max_drawdown(daily_returns: pd.Series) -> float:
 
 def composite_score(sharpe: float, pf: float, mdd: float) -> float:
     """
-    score = Sharpe_Ratio × 0.6  +  Profit_Factor × 0.2  −  Max_Drawdown × 0.2
-    This is the FIXED metric. Do not change.
+    score = Sharpe × 0.6  +  ProfitFactor × 0.2  −  MaxDrawdown × 0.2
+    Fixed metric — do not change.
     """
     return round(sharpe * 0.6 + pf * 0.2 - mdd * 0.2, 6)
 
 
 def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
-    """Run strategy on one shard and return a metrics dict."""
+    """
+    Run strategy on one shard (which includes a warm-up buffer) and return
+    metrics computed only over the target evaluation window.
+    """
+    eval_start = shard.attrs.get("eval_start", shard.index[0])
+
     try:
-        signals  = generate_signals_fn(shard)
-        trades   = simulate_trades(shard, signals)
-        dr       = trades["daily_return"]
-        sh       = sharpe_ratio(dr)
-        pf_      = profit_factor(dr)
-        mdd      = max_drawdown(dr)
-        sc       = composite_score(sh, pf_, mdd)
-        n_trades = int((signals["signal"].diff().abs() > 0).sum())
+        # Run indicators over the FULL shard (including warm-up) so they
+        # are initialised by the time we reach the evaluation window.
+        signals = generate_signals_fn(shard)
+        trades  = simulate_trades(shard, signals)
+
+        # Strip warm-up rows before scoring
+        dr_full = trades["daily_return"]
+        dr      = strip_warmup(dr_full, eval_start)
+
+        if len(dr) == 0:
+            return _empty_result(shard, "no eval bars after warm-up strip")
+
+        sh   = sharpe_ratio(dr)
+        pf_  = profit_factor(dr)
+        mdd  = max_drawdown(dr)
+        sc   = composite_score(sh, pf_, mdd)
+
+        sig_eval  = strip_warmup(signals["signal"], eval_start)
+        n_trades  = int((sig_eval.diff().abs() > 0).sum())
+
         return {
-            "sharpe":        round(sh,   4),
-            "profit_factor": round(pf_,  4),
-            "max_drawdown":  round(mdd,  4),
+            "sharpe":        round(sh,  4),
+            "profit_factor": round(pf_, 4),
+            "max_drawdown":  round(mdd, 4),
             "score":         sc,
             "n_trades":      n_trades,
-            "n_bars":        len(shard),
+            "n_bars":        len(dr),
             "error":         None,
         }
     except Exception as exc:
@@ -199,12 +252,20 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn) -> dict:
         }
 
 
+def _empty_result(shard: pd.DataFrame, reason: str) -> dict:
+    return {
+        "sharpe": 0.0, "profit_factor": 0.0,
+        "max_drawdown": 0.0, "score": 0.0,
+        "n_trades": 0, "n_bars": len(shard),
+        "error": reason,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Strategy hot-loader
 # ---------------------------------------------------------------------------
 
 def load_strategy(path: Path):
-    """Dynamically load (or reload) strategy.py. Returns the module."""
     spec   = importlib.util.spec_from_file_location("strategy", str(path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -212,20 +273,10 @@ def load_strategy(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# LLM — HuggingFace open-source (Qwen / Gemma), 4-bit quantised
+# LLM pipeline
 # ---------------------------------------------------------------------------
 
 def build_llm_pipeline(model_id: str, device: str):
-    """
-    Load a Qwen instruct model via HuggingFace Transformers.
-    No quantisation — uses float16 with device_map='auto' (mirrors the
-    Phi-3 loading pattern from the financial analysis agent notebook).
-
-    Recommended model IDs:
-      Qwen/Qwen2.5-72B-Instruct   (A100, best reasoning)
-      Qwen/Qwen2.5-32B-Instruct   (L4, good balance)
-      Qwen/Qwen2.5-7B-Instruct    (smaller GPU, faster)
-    """
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -236,7 +287,6 @@ def build_llm_pipeline(model_id: str, device: str):
     print(f"[llm] Loading {model_id} on {device} ...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
@@ -259,7 +309,7 @@ def build_llm_pipeline(model_id: str, device: str):
 
 
 # ---------------------------------------------------------------------------
-# Prompt construction  — injects program.md verbatim, just like AutoResearch
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 def build_prompt(
@@ -269,29 +319,27 @@ def build_prompt(
     aggregate_score: float,
     iteration: int,
     history: list[dict],
+    last_failed_source: Optional[str] = None,
+    last_failed_score:  Optional[float] = None,
 ) -> list[dict]:
     """
     Build the chat-format messages list for the LLM.
 
-    The LLM receives:
-      - program.md verbatim as the system prompt  (read-only context)
-      - current strategy.py + results as the user message  (writable context)
-
-    This mirrors AutoResearch where the LLM is told to 'read these files for
-    full context' and program.md is the live spec.
+    Now includes the failed strategy code (if any) so the LLM knows
+    exactly what it tried last and why it didn't improve.
     """
     # ---- Per-shard results table ----
     rows = []
-    for yr, m in shard_results.items():
+    for key, m in shard_results.items():
         err = f"  ERR: {m['error'][:50]}" if m["error"] else ""
         rows.append(
-            f"  {yr} | Sharpe={m['sharpe']:>7.4f} | PF={m['profit_factor']:>5.2f} "
+            f"  {key} | Sharpe={m['sharpe']:>7.4f} | PF={m['profit_factor']:>5.2f} "
             f"| MDD={m['max_drawdown']:>5.3f} | Score={m['score']:>8.5f} "
             f"| Trades={m['n_trades']:>4}{err}"
         )
     shard_table = "\n".join(rows)
 
-    # ---- Last 5 iterations of score history ----
+    # ---- Score history ----
     hist_lines = [
         f"  iter {h['iteration']:>3}: aggregate={h['aggregate_score']:.5f}  "
         f"status={h['status']}"
@@ -299,10 +347,7 @@ def build_prompt(
     ] or ["  (no history yet — this is the baseline run)"]
     hist_str = "\n".join(hist_lines)
 
-    # ---- System prompt = program.md verbatim ----
-    system_prompt = program_source
-
-    # ---- User message = results + current strategy ----
+    # ---- Task line ----
     if iteration == 1:
         task_line = (
             "This is iteration 1 — the BASELINE run. "
@@ -310,22 +355,34 @@ def build_prompt(
         )
     else:
         task_line = (
-            f"The previous aggregate score was {aggregate_score:.5f}. "
+            f"The CURRENT BEST aggregate score is {aggregate_score:.5f}. "
             "Propose an improved strategy.py. Be hypothesis-driven. "
-            "Reference the weakest shards in your reasoning."
+            "Reference the weakest monthly shards in your reasoning."
+        )
+
+    # ---- Failure context block (the key fix for Trap 2) ----
+    failure_block = ""
+    if last_failed_source is not None:
+        failure_block = (
+            f"\n--- YOUR LAST ATTEMPT (score={last_failed_score:.5f}, NOT an improvement) ---\n"
+            f"Study this carefully. Do NOT repeat the same changes. "
+            f"Propose something meaningfully different.\n\n"
+            f"{last_failed_source}\n"
+            f"--- END OF LAST ATTEMPT ---\n"
         )
 
     user_content = (
         f"=== ITERATION {iteration} ===\n\n"
-        f"--- Per-shard results ---\n{shard_table}\n\n"
+        f"--- Per-shard results (current best strategy) ---\n{shard_table}\n\n"
         f"--- Aggregate score: {aggregate_score:.5f} ---\n\n"
         f"--- Score history (last 5) ---\n{hist_str}\n\n"
-        f"--- Current strategy.py ---\n{strategy_source}\n\n"
+        f"{failure_block}"
+        f"--- Current BEST strategy.py ---\n{strategy_source}\n\n"
         f"{task_line}"
     )
 
     return [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": program_source},
         {"role": "user",   "content": user_content},
     ]
 
@@ -335,7 +392,6 @@ def build_prompt(
 # ---------------------------------------------------------------------------
 
 def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Extract <reasoning> and <strategy> blocks from LLM output."""
     r_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL | re.IGNORECASE)
     s_match = re.search(r"<strategy>(.*?)</strategy>",   text, re.DOTALL | re.IGNORECASE)
 
@@ -343,7 +399,6 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
     strategy  = s_match.group(1).strip() if s_match else None
 
     if strategy:
-        # Strip accidental markdown fences
         strategy = re.sub(r"^```[a-zA-Z]*\n?", "", strategy)
         strategy = re.sub(r"\n?```$",           "", strategy)
         strategy = strategy.strip()
@@ -352,7 +407,6 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def validate_syntax(code: str) -> tuple[bool, str]:
-    """Return (ok, error_message)."""
     try:
         compile(code, "<strategy>", "exec")
         return True, ""
@@ -385,7 +439,7 @@ def write_trigger(score: float, iteration: int, params: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main loop — mirrors AutoResearch's experiment loop exactly
+# Main loop
 # ---------------------------------------------------------------------------
 
 def run(
@@ -394,13 +448,12 @@ def run(
     end:        str,
     model_id:   str,
     device:     str,
-    iterations: int,       # ignored when forever=True
+    iterations: int,
     forever:    bool,
     patience:   int,
     start_year: int,
 ) -> None:
 
-    # ---- Setup ----
     init_results_tsv()
 
     program_source = PROGRAM_FILE.read_text()
@@ -408,16 +461,19 @@ def run(
 
     df     = download_data(ticker, start, end)
     shards = make_shards(df, start_year=start_year)
-    print(f"[data] Shards: {list(shards.keys())}")
+    print(f"[data] Monthly shards: {list(shards.keys())}")
 
     pipe = build_llm_pipeline(model_id, device)
 
-    best_score = -math.inf
-    no_improve = 0
+    best_score         = -math.inf
+    no_improve         = 0
     history: list[dict] = []
-    iteration  = 0
+    iteration          = 0
 
-    # ---- Loop forever (like AutoResearch) or up to iterations ----
+    # Track the last failed attempt so the LLM can learn from it
+    last_failed_source: Optional[str] = None
+    last_failed_score:  Optional[float] = None
+
     while True:
         iteration += 1
         if not forever and iteration > iterations:
@@ -430,49 +486,53 @@ def run(
 
         # ---- Load strategy ----
         try:
-            strat = load_strategy(STRATEGY_FILE)
+            strat               = load_strategy(STRATEGY_FILE)
             generate_signals_fn = strat.generate_signals
             current_params      = strat.get_params()
         except Exception as exc:
             print(f"[strategy] CRASH loading strategy.py: {exc}")
             traceback.print_exc()
-            # Roll back to best known good
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
                 print("[strategy] Rolled back to best_strategy.py")
             append_results_tsv(iteration, 0.0, "crash", f"load error: {exc}", {})
             continue
 
-        # ---- Evaluate on all shards ----
+        # ---- Evaluate on all monthly shards ----
         shard_results: dict[str, dict] = {}
         any_crash = False
-        for year, shard_df in shards.items():
-            print(f"  Shard {year}: {len(shard_df)} bars", end="  →  ", flush=True)
+        for key, shard_df in shards.items():
             m = evaluate_shard(shard_df, generate_signals_fn)
-            shard_results[year] = m
-            if m["error"]:
+            shard_results[key] = m
+            if m["error"] and m["score"] == -99.0:
                 any_crash = True
-            print(
+            status_str = (
                 f"Sharpe={m['sharpe']:>7.4f}  PF={m['profit_factor']:>5.2f}  "
                 f"MDD={m['max_drawdown']:>5.3f}  Score={m['score']:>8.5f}  "
-                f"Trades={m['n_trades']:>4}"
-                + (f"  [ERR: {m['error']}]" if m["error"] else "")
+                f"Trades={m['n_trades']:>3}"
             )
+            err_str = f"  [ERR: {m['error']}]" if m["error"] else ""
+            print(f"  {key}: {status_str}{err_str}")
 
-        valid_scores = [m["score"] for m in shard_results.values() if not m["error"]]
+        valid_scores = [m["score"] for m in shard_results.values() if m["score"] != -99.0]
         aggregate    = float(np.mean(valid_scores)) if valid_scores else -99.0
         print(f"\n  ► Aggregate: {aggregate:.5f}   Best so far: {best_score:.5f}")
 
-        # ---- Determine status: keep / discard / crash ----
+        # ---- Determine status ----
         if any_crash and not valid_scores:
             status      = "crash"
             description = "all shards errored"
         elif aggregate > best_score:
             status      = "keep" if iteration > 1 else "baseline"
             description = f"iter {iteration}: aggregate={aggregate:.5f}"
+        elif aggregate == best_score:
+            # Exploration: score didn't improve but didn't regress either.
+            # Let the mutated code stand so the LLM can keep wandering.
+            status      = "explore"
+            description = f"iter {iteration}: flat ({aggregate:.5f}), keeping for exploration"
         else:
             status      = "discard" if iteration > 1 else "baseline"
-            description = f"iter {iteration}: no improvement ({aggregate:.5f} vs {best_score:.5f})"
+            description = f"iter {iteration}: regression ({aggregate:.5f} < {best_score:.5f})"
 
         # ---- Log ----
         record = {
@@ -487,49 +547,65 @@ def run(
         append_results_tsv(iteration, aggregate, status, description, current_params)
         history.append(record)
 
-        # ---- Advance or roll back (AutoResearch pattern) ----
+        # ---- Advance or roll back ----
         if aggregate > best_score:
-            best_score = aggregate
-            no_improve = 0
+            best_score          = aggregate
+            no_improve          = 0
+            last_failed_source  = None
+            last_failed_score   = None
             shutil.copy(STRATEGY_FILE, BEST_FILE)
             print(f"  ★ New best! Saved to best_strategy.py")
             write_trigger(best_score, iteration, current_params)
-        else:
+
+        elif aggregate == best_score:
+            # Exploration mode — do NOT roll back. The LLM keeps its mutated code.
             no_improve += 1
-            # ROLL BACK — restore strategy.py to the best known good version
+            print(f"  ~ Exploration move kept (no_improve={no_improve}/{patience})")
+            # No failure to report — the code is still live
+            last_failed_source = None
+            last_failed_score  = None
+
+        else:
+            # Regression — roll back and remember what failed
+            no_improve         += 1
+            last_failed_source  = STRATEGY_FILE.read_text()
+            last_failed_score   = aggregate
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
-                print(f"  ✗ Rolled back to best_strategy.py  (no_improve={no_improve}/{patience})")
-            if no_improve >= patience and not forever:
-                print("[loop] Plateau reached. Stopping.")
-                break
+                print(f"  ✗ Regression: rolled back to best_strategy.py  (no_improve={no_improve}/{patience})")
+            else:
+                print(f"  ✗ Regression, no best file yet — keeping current code.")
+
+        if no_improve >= patience and not forever:
+            print("[loop] Plateau reached. Stopping.")
+            break
 
         # ---- Call LLM for next proposal ----
-        # Re-read strategy source AFTER potential rollback
+        # Re-read strategy AFTER potential rollback so the LLM always sees
+        # the current best. The failed attempt is passed separately.
         strategy_source = STRATEGY_FILE.read_text()
 
         messages = build_prompt(
-            program_source  = program_source,
-            strategy_source = strategy_source,
-            shard_results   = shard_results,
-            aggregate_score = aggregate if aggregate > -99.0 else best_score,
-            iteration       = iteration,
-            history         = history,
+            program_source     = program_source,
+            strategy_source    = strategy_source,
+            shard_results      = shard_results,
+            aggregate_score    = best_score if best_score > -math.inf else aggregate,
+            iteration          = iteration,
+            history            = history,
+            last_failed_source = last_failed_source,
+            last_failed_score  = last_failed_score,
         )
 
         print("\n[llm] Generating next strategy ...")
         try:
-            formatted = pipe.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+            formatted  = pipe.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
             )
             outputs    = pipe(formatted)
             llm_output = outputs[0]["generated_text"]
         except Exception as exc:
             print(f"[llm] Generation failed: {exc}")
             traceback.print_exc()
-            # Don't break the loop — the harness will re-run current best next iter
             continue
 
         reasoning, new_strategy = parse_llm_response(llm_output)
@@ -544,14 +620,12 @@ def run(
         syntax_ok, syntax_err = validate_syntax(new_strategy)
         if not syntax_ok:
             print(f"[parse] Syntax error — keeping current best. Error: {syntax_err}")
-            # Log the crash but don't overwrite strategy.py
             append_results_tsv(
                 iteration + 1, 0.0, "crash",
                 f"syntax error: {syntax_err[:80]}", {}
             )
             continue
 
-        # ---- Write the new strategy for the next evaluation ----
         STRATEGY_FILE.write_text(new_strategy)
         print("[strategy] strategy.py updated for next iteration.")
 
@@ -578,10 +652,8 @@ def parse_args() -> argparse.Namespace:
         "--ticker", default="^GSPC",
         help="Yahoo Finance ticker.\n  ^GSPC = S&P 500 (default)\n  ^NDX  = NASDAQ-100",
     )
-    p.add_argument("--start",      default="2018-01-01",
-                   help="Data start date (YYYY-MM-DD)")
-    p.add_argument("--end",        default="2024-12-31",
-                   help="Data end date  (YYYY-MM-DD)")
+    p.add_argument("--start",      default="2018-01-01")
+    p.add_argument("--end",        default="2024-12-31")
     p.add_argument(
         "--model",
         default="Qwen/Qwen2.5-32B-Instruct",
@@ -593,16 +665,11 @@ def parse_args() -> argparse.Namespace:
             "  google/gemma-3-27b-it       (alternative)"
         ),
     )
-    p.add_argument("--device",     default="cuda",
-                   help="cuda | cpu")
-    p.add_argument("--iterations", type=int, default=20,
-                   help="Max iterations (ignored if --forever)")
-    p.add_argument("--forever",    action="store_true",
-                   help="Run indefinitely until interrupted (mirrors AutoResearch behaviour)")
-    p.add_argument("--patience",   type=int, default=5,
-                   help="Stop after N consecutive non-improvements (only without --forever)")
-    p.add_argument("--start_year", type=int, default=2018,
-                   help="First shard year")
+    p.add_argument("--device",     default="cuda")
+    p.add_argument("--iterations", type=int, default=20)
+    p.add_argument("--forever",    action="store_true")
+    p.add_argument("--patience",   type=int, default=5)
+    p.add_argument("--start_year", type=int, default=2018)
     return p.parse_args()
 
 
