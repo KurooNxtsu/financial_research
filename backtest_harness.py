@@ -296,7 +296,7 @@ def build_llm_pipeline(model_id: str, device: str):
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=1024,
+        max_new_tokens=2048,
         temperature=0.3,
         do_sample=True,
         return_full_text=False,
