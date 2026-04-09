@@ -572,7 +572,7 @@ def build_prompt(
         )
 
     # Truncate strategy source to avoid blowing context window on small models
-    MAX_STRATEGY_CHARS = 2000
+    MAX_STRATEGY_CHARS = 10000
     strategy_display = strategy_source
     if len(strategy_source) > MAX_STRATEGY_CHARS:
         strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + "\n# ... (truncated for context)"
