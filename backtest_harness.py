@@ -183,7 +183,42 @@ def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
     """Return only the bars from eval_start onward."""
     return series[series.index >= eval_start]
 
+def normalise_signals(signals: pd.DataFrame) -> pd.DataFrame:
+    """Convert any known signal format into a unified 'signal' column DataFrame."""
+    if "signal" in signals.columns:
+        return signals
 
+    cols = set(signals.columns)
+
+    if {"long_entry", "long_exit", "short_entry", "short_exit"}.issubset(cols):
+        position, unified = 0, []
+        for le, lx, se, sx in zip(
+            signals["long_entry"], signals["long_exit"],
+            signals["short_entry"], signals["short_exit"],
+        ):
+            if le:        position =  1
+            elif se:      position = -1
+            elif lx or sx: position = 0
+            unified.append(position)
+        signals = signals.copy()
+        signals["signal"] = unified
+
+    elif {"long_entry", "long_exit"}.issubset(cols):
+        position, unified = 0, []
+        for le, lx in zip(signals["long_entry"], signals["long_exit"]):
+            if le:   position = 1
+            elif lx: position = 0
+            unified.append(position)
+        signals = signals.copy()
+        signals["signal"] = unified
+
+    else:
+        raise ValueError(
+            f"generate_signals must return a DataFrame with a 'signal' column. "
+            f"Got columns: {list(signals.columns)}"
+        )
+
+    return signals
 # ---------------------------------------------------------------------------
 # Trade simulator  (fixed — do not modify)
 # ---------------------------------------------------------------------------
@@ -280,6 +315,7 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> 
 
     try:
         signals = generate_signals_fn(shard)
+        signals = normalise_signals(signals)
         trades  = simulate_trades(shard, signals)
 
         dr_full = trades["daily_return"]
