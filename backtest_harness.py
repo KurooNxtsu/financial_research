@@ -297,13 +297,13 @@ def max_drawdown(daily_returns: pd.Series) -> float:
     dd  = (cum - cum.cummax()) / cum.cummax()
     return float(abs(dd.min()))
 
-
 def composite_score(sharpe: float, pf: float, mdd: float) -> float:
     """
     score = Sharpe × 0.6  +  ProfitFactor × 0.2  −  MaxDrawdown × 0.2
     Fixed metric — do not change.
     """
     return round(sharpe * 0.6 + pf * 0.2 - mdd * 0.2, 6)
+
 
 def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool, str]:
     """
@@ -315,17 +315,32 @@ def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool,
         strat = load_strategy(path)
         signals = strat.generate_signals(df_sample)
         signals = normalise_signals(signals)
-        
+
         if "signal" not in signals.columns:
             return False, "no 'signal' column after normalisation"
-        
+
         n_active = (signals["signal"] != 0).sum()
         if n_active == 0:
             return False, f"zero non-flat signals on validation sample ({len(df_sample)} bars)"
-        
-        return True, f"ok — {n_active} active signal bars"
+
+        n_long  = (signals["signal"] == 1).sum()
+        n_short = (signals["signal"] == -1).sum()
+        n_total = len(signals)
+        if n_long / n_total > 0.95:
+            return False, f"strategy is {n_long/n_total:.0%} long — likely stuck"
+        if n_short / n_total > 0.95:
+            return False, f"strategy is {n_short/n_total:.0%} short — likely stuck"
+
+        transitions = (signals["signal"].diff().abs() > 0).sum()
+        if transitions < 2:
+            return False, f"only {transitions} signal transitions — not a real strategy"
+
+        return True, f"ok — {n_active} active bars, {transitions} transitions"
+
     except Exception as exc:
         return False, str(exc)
+
+
 def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> dict:
     """
     Run strategy on one shard (which includes a warm-up buffer) and return
@@ -357,12 +372,9 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> 
 
         sig_eval = strip_warmup(signals["signal"], eval_start)
         n_trades = int((sig_eval.diff().abs() > 0).sum())
-
-        # Signal distribution for debugging
         sig_counts = sig_eval.value_counts().to_dict()
 
-# Penalise zero-trade shards so the optimiser can't exploit
-# the metric artifact (Sharpe=0, PF=10, MDD=0 → score=2.0)
+        # Penalise zero-trade shards
         if n_trades == 0:
             sc = 0.0
 
