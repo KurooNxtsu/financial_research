@@ -189,6 +189,11 @@ def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    if "signal" not in signals.columns:
+        raise ValueError(
+            f"generate_signals must return a DataFrame with a 'signal' column. "
+            f"Got columns: {list(signals.columns)}"
+        )
     pos     = signals["signal"].shift(1).fillna(0)
     log_ret = np.log(df["Close"] / df["Close"].shift(1)).fillna(0)
     strat   = pos * log_ret
