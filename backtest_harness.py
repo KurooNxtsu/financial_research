@@ -490,7 +490,7 @@ def build_llm_pipeline(model_id: str, device: str):
             "text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=2048,
+            max_new_tokens=4096,
             temperature=0.7,       # recommended for non-thinking general tasks
             top_p=0.8,             # recommended value from model card
             do_sample=True,
@@ -572,7 +572,7 @@ def build_prompt(
         )
 
     # Truncate strategy source to avoid blowing context window on small models
-    MAX_STRATEGY_CHARS = 3000
+    MAX_STRATEGY_CHARS = 2000
     strategy_display = strategy_source
     if len(strategy_source) > MAX_STRATEGY_CHARS:
         strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + "\n# ... (truncated for context)"
