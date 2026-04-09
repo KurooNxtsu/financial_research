@@ -341,6 +341,11 @@ def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> 
         # Signal distribution for debugging
         sig_counts = sig_eval.value_counts().to_dict()
 
+# Penalise zero-trade shards so the optimiser can't exploit
+# the metric artifact (Sharpe=0, PF=10, MDD=0 → score=2.0)
+        if n_trades == 0:
+            sc = 0.0
+
         result = {
             "sharpe":        round(sh,  4),
             "profit_factor": round(pf_, 4),
