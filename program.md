@@ -278,6 +278,13 @@ Concise explanation (≤ 150 words) of what you changed and why, referencing:
 - `generate_signals(df: pd.DataFrame) -> pd.DataFrame` signature must not change.
 - `get_params() -> dict` must return a flat dict of all current parameter values.
 - Do not add new imports.
+-**CRITICAL — generate_signals output guard:**
+Your `generate_signals` MUST produce non-zero signals on NVDA data.
+The baseline strategy uses `rsi_value < oversold + 15` (i.e. RSI < 45) as the
+long entry RSI condition — NOT `rsi_value < oversold` (RSI < 30). The latter
+almost never fires on a trending stock. If you tighten RSI thresholds too much,
+you get zero trades and a score of 0.0. Always verify your entry conditions can
+realistically fire on a momentum stock.
 
 ---
 

@@ -305,7 +305,27 @@ def composite_score(sharpe: float, pf: float, mdd: float) -> float:
     """
     return round(sharpe * 0.6 + pf * 0.2 - mdd * 0.2, 6)
 
-
+def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Run generate_signals on a small sample and verify:
+    1. Returns a DataFrame with a 'signal' column (after normalisation)
+    2. Produces at least 1 non-zero signal (not a do-nothing strategy)
+    """
+    try:
+        strat = load_strategy(path)
+        signals = strat.generate_signals(df_sample)
+        signals = normalise_signals(signals)
+        
+        if "signal" not in signals.columns:
+            return False, "no 'signal' column after normalisation"
+        
+        n_active = (signals["signal"] != 0).sum()
+        if n_active == 0:
+            return False, f"zero non-flat signals on validation sample ({len(df_sample)} bars)"
+        
+        return True, f"ok — {n_active} active signal bars"
+    except Exception as exc:
+        return False, str(exc)
 def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> dict:
     """
     Run strategy on one shard (which includes a warm-up buffer) and return
@@ -812,7 +832,10 @@ def run(
         if stale_count >= MAX_STALE:
             vlog("STALE SKIP LLM", "Skipping LLM generation this iteration due to flat metrics.")
             continue
-
+        if iteration == 1 and BEST_FILE.exists():
+            vlog("ITER1 SKIP", "Iteration 1: copying best_strategy.py directly, skipping LLM.")
+            shutil.copy(BEST_FILE, STRATEGY_FILE)
+            continue
         # ---- Build prompt ----
         strategy_source = STRATEGY_FILE.read_text()
 
@@ -914,7 +937,23 @@ def run(
             print(f"[parse] Contract error — {contract_err}. Keeping current best.")
             append_results_tsv(iteration + 1, 0.0, "crash", f"contract error: {contract_err}", {})
             continue
+        # ---- Validate output (new check) ----
+        # Use the largest shard as the validation sample
+        validation_df = list(shards.values())[-1]  # e.g. 2024 shard
+        output_ok, output_err = validate_strategy_output(STRATEGY_FILE, validation_df)
 
+        vlog("VALIDATION OUTPUT",
+            f"Output OK    : {output_ok}\n"
+            f"Output error : {output_err or 'none'}"
+        )
+
+        if not output_ok:
+            print(f"[validate] Output check failed — {output_err}. Keeping current best.")
+            append_results_tsv(iteration + 1, 0.0, "crash", f"output check: {output_err}", {})
+            # Roll back immediately
+            if BEST_FILE.exists():
+                shutil.copy(BEST_FILE, STRATEGY_FILE)
+            continue
         # ---- Write ----
         STRATEGY_FILE.write_text(new_strategy)
         vlog("STRATEGY WRITTEN",
