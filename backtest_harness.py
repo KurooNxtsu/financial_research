@@ -474,7 +474,7 @@ def build_llm_pipeline(model_id: str, device: str):
     )
     model.eval()
 
-pipe = pipeline(
+    pipe = pipeline(
             "text-generation",
             model=model,
             tokenizer=tokenizer,
