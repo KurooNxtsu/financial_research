@@ -189,11 +189,44 @@ def strip_warmup(series: pd.Series, eval_start: pd.Timestamp) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    # --- Normalise signal column ---
     if "signal" not in signals.columns:
-        raise ValueError(
-            f"generate_signals must return a DataFrame with a 'signal' column. "
-            f"Got columns: {list(signals.columns)}"
-        )
+        cols = set(signals.columns)
+        
+        # Handle long_entry / long_exit / short_entry / short_exit pattern
+        if {"long_entry", "long_exit", "short_entry", "short_exit"}.issubset(cols):
+            position = 0
+            unified  = []
+            for le, lx, se, sx in zip(
+                signals["long_entry"],
+                signals["long_exit"],
+                signals["short_entry"],
+                signals["short_exit"],
+            ):
+                if le:   position =  1
+                elif se: position = -1
+                elif lx or sx: position = 0
+                unified.append(position)
+            signals = signals.copy()
+            signals["signal"] = unified
+
+        # Handle long_entry / long_exit only (no shorts)
+        elif {"long_entry", "long_exit"}.issubset(cols):
+            position = 0
+            unified  = []
+            for le, lx in zip(signals["long_entry"], signals["long_exit"]):
+                if le:   position = 1
+                elif lx: position = 0
+                unified.append(position)
+            signals = signals.copy()
+            signals["signal"] = unified
+
+        else:
+            raise ValueError(
+                f"generate_signals must return a DataFrame with a 'signal' column. "
+                f"Got columns: {list(signals.columns)}"
+            )
+
     pos     = signals["signal"].shift(1).fillna(0)
     log_ret = np.log(df["Close"] / df["Close"].shift(1)).fillna(0)
     strat   = pos * log_ret
@@ -204,7 +237,6 @@ def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
         "daily_return":      np.exp(strat) - 1,
         "cumulative_return": strat.cumsum().apply(np.exp) - 1,
     }, index=df.index)
-
 
 # ---------------------------------------------------------------------------
 # Metrics  (fixed — do not modify)
