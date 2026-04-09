@@ -474,15 +474,16 @@ def build_llm_pipeline(model_id: str, device: str):
     )
     model.eval()
 
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=2048,
-        temperature=0.3,
-        do_sample=True,
-        return_full_text=False,
-    )
+pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=2048,
+            temperature=0.7,       # recommended for non-thinking general tasks
+            top_p=0.8,             # recommended value from model card
+            do_sample=True,
+            return_full_text=False,
+        )
 
     vlog("LLM LOADED",
         f"Model          : {model_id}\n"
@@ -865,8 +866,11 @@ def run(
 
         try:
             formatted = pipe.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        chat_template_kwargs={"enable_thinking": False},  # Qwen3.5 syntax, different from Qwen3
+                    )
             estimated_tokens = len(formatted) // 4
             vlog("LLM INPUT",
                 f"Formatted prompt length : {len(formatted)} chars\n"
@@ -999,7 +1003,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end",        default="2024-12-31")
     p.add_argument(
         "--model",
-        default="Qwen/Qwen2.5-7B-Instruct",
+        default="Qwen/Qwen3.5-8B-Instruct",
         help=(
             "HuggingFace model ID.\n"
             "  Qwen/Qwen2.5-72B-Instruct  (A100 — best)\n"
