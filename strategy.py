@@ -207,7 +207,7 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     signal = pd.Series(0,      index=df.index, dtype=int)
     stop   = pd.Series(np.nan, index=df.index, dtype=float)
 
-    position    = 0       # current position: 1, -1, or 0
+    position    = 0
     active_stop = np.nan
 
     for i in range(1, n):
@@ -230,16 +230,18 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
         # ---- Entry (only when flat) ----
         if position == 0:
+            # FIX: Use RSI zone check (value in zone) instead of crossover
+            # (single-bar crossover is too rare in a ~21-bar monthly window).
+            # FIX: Drop VWAP from entry — it contradicts the RSI zone condition.
+            # Ichimoku provides the trend filter; RSI zone provides momentum.
             long_entry = (
-                bool(ichi["bullish"].iloc[i])
-                and bool(rsi_["buy_signal"].iloc[i])
-                and bool(vwap_["above_vwap"].iloc[i])
+                bool(ichi["bullish"].iloc[i])                   # price above cloud
+                and rsi_["rsi_value"].iloc[i] < RSI_PARAMS["oversold"] + 15  # RSI < 45: mild weakness in uptrend
                 and not np.isnan(atr_["long_stop"].iloc[i])
             )
             short_entry = (
-                bool(ichi["bearish"].iloc[i])
-                and bool(rsi_["sell_signal"].iloc[i])
-                and bool(vwap_["below_vwap"].iloc[i])
+                bool(ichi["bearish"].iloc[i])                   # price below cloud
+                and rsi_["rsi_value"].iloc[i] > RSI_PARAMS["overbought"] - 15  # RSI > 55: mild strength in downtrend
                 and not np.isnan(atr_["short_stop"].iloc[i])
             )
 
@@ -254,8 +256,6 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
         stop.iloc[i]   = active_stop
 
     return pd.DataFrame({"signal": signal, "stop": stop}, index=df.index)
-
-
 # ---------------------------------------------------------------------------
 # METADATA — used by the harness for logging and the GitHub trigger payload
 # ---------------------------------------------------------------------------
