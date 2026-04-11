@@ -589,14 +589,12 @@ def build_prompt(
             "Do NOT write anything outside these two tags."
         )
 
-    # ---- Failure context block ----
+# ---- Failure context block ----
     failure_block = ""
     if last_failed_source is not None:
         MAX_FAILED_CHARS = 2000
         failed_display = last_failed_source
         if len(last_failed_source) > MAX_FAILED_CHARS:
-            # Only show the generate_signals function from the failed attempt,
-            # since that's the only part the LLM changed and needs to learn from.
             gs_idx = last_failed_source.find("def generate_signals")
             if gs_idx != -1:
                 failed_display = (
@@ -606,13 +604,13 @@ def build_prompt(
             else:
                 failed_display = last_failed_source[:MAX_FAILED_CHARS] + "\n# ... (truncated)"
 
-    failure_block = (
-        f"\n--- YOUR LAST ATTEMPT (score={last_failed_score:.5f}, NOT an improvement) ---\n"
-        f"Study this carefully. Do NOT repeat the same changes. "
-        f"Propose something meaningfully different.\n\n"
-        f"{failed_display}\n"
-        f"--- END OF LAST ATTEMPT ---\n"
-    )
+        failure_block = (                                          # <-- indented inside the if
+            f"\n--- YOUR LAST ATTEMPT (score={last_failed_score:.5f}, NOT an improvement) ---\n"
+            f"Study this carefully. Do NOT repeat the same changes. "
+            f"Propose something meaningfully different.\n\n"
+            f"{failed_display}\n"
+            f"--- END OF LAST ATTEMPT ---\n"
+        )
 
     # Only show the LLM the editable parts to save context tokens.
     # The indicator function bodies are frozen — no need to include them in full.
