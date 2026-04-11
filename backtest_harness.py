@@ -490,7 +490,7 @@ def build_llm_pipeline(model_id: str, device: str):
             "text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=4096,
+            max_new_tokens=8192,
             temperature=0.4,       # recommended for non-thinking general tasks
             top_p=0.8,             # recommended value from model card
             do_sample=True,
@@ -553,7 +553,7 @@ def build_prompt(
     else:
         task_line = (
             f"The CURRENT BEST aggregate score is {aggregate_score:.5f}. "
-            "Propose an improved strategy.py.\n\n"
+            "Propose an improved strategy.py.  /no_think\n\n\n\n"
             "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
             "<reasoning>\nYour analysis here\n</reasoning>\n"
             "<strategy>\n# full python code here\n</strategy>\n\n"
@@ -571,11 +571,13 @@ def build_prompt(
             f"--- END OF LAST ATTEMPT ---\n"
         )
 
-    # Truncate strategy source to avoid blowing context window on small models
-    MAX_STRATEGY_CHARS = 10000
+# Only show the LLM the editable parts to save context tokens
+    MAX_STRATEGY_CHARS = 4000
     strategy_display = strategy_source
     if len(strategy_source) > MAX_STRATEGY_CHARS:
-        strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + "\n# ... (truncated for context)"
+        strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + \
+            "\n\n# ... (indicator function bodies omitted — do not modify them)\n" + \
+            "# Include all four indicator functions with their ORIGINAL implementations in your output."
 
     user_content = (
         f"=== ITERATION {iteration} ===\n\n"
