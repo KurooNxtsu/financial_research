@@ -576,17 +576,20 @@ def build_prompt(
             "This is iteration 1 — the BASELINE run. "
             "Output the current strategy.py UNCHANGED.\n\n"
             "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
-            "<reasoning>\nBaseline run, no changes.\n</reasoning>\n"
-            "<strategy>\n# paste strategy here unchanged\n</strategy>"
+            "[reasoning]\nBaseline run, no changes.\n[/reasoning]\n"
+            "[strategy]\n# paste strategy here unchanged\n[/strategy]\n\n"
+            "IMPORTANT: Use angle brackets < > not square brackets — "
+            "the above is just the format description."
         )
     else:
         task_line = (
             f"The CURRENT BEST aggregate score is {aggregate_score:.5f}. "
             "Propose an improved strategy.py. /no_think\n\n"
-            "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
-            "<reasoning>\nYour analysis here\n</reasoning>\n"
-            "<strategy>\n# full python code here\n</strategy>\n\n"
-            "Do NOT write anything outside these two tags."
+            "YOU MUST RESPOND IN EXACTLY THIS FORMAT:\n"
+            "  <reasoning> ... your analysis ... </reasoning>\n"
+            "  <strategy> ... full python code ... </strategy>\n\n"
+            "Do NOT write anything outside these two tags.\n"
+            "The <strategy> block must be complete valid Python with NO markdown fences."
         )
 
 # ---- Failure context block ----
@@ -644,18 +647,24 @@ def build_prompt(
 # ---------------------------------------------------------------------------
 
 def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
-    r_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL | re.IGNORECASE)
-    s_match = re.search(r"<strategy>(.*?)</strategy>",   text, re.DOTALL | re.IGNORECASE)
+    # Take the LAST match to avoid hitting template examples in the prompt echo
+    r_matches = re.findall(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL | re.IGNORECASE)
+    s_matches = re.findall(r"<strategy>(.*?)</strategy>",   text, re.DOTALL | re.IGNORECASE)
 
-    reasoning = r_match.group(1).strip() if r_match else None
-    strategy  = s_match.group(1).strip() if s_match else None
+    reasoning = r_matches[-1].strip() if r_matches else None
+
+    # Pick the longest strategy match (the real code, not a placeholder)
+    if s_matches:
+        strategy = max(s_matches, key=len).strip()
+    else:
+        strategy = None
 
     # Fallback: grab the largest ```python``` block
-    if not strategy:
+    if not strategy or len(strategy) < 100:   # <-- reject tiny placeholder matches
         blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
         if blocks:
             strategy = max(blocks, key=len).strip()
-            vlog("PARSE FALLBACK", "No <strategy> tag found — fell back to largest ```python``` block")
+            vlog("PARSE FALLBACK", "No valid <strategy> tag found — fell back to largest ```python``` block")
 
     if strategy:
         strategy = re.sub(r"^```[a-zA-Z]*\n?", "", strategy)
@@ -663,7 +672,6 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
         strategy = strategy.strip()
 
     return reasoning, strategy
-
 
 # ---------------------------------------------------------------------------
 # Auto-repair: append missing boilerplate when output is truncated
