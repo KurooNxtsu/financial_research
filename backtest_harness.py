@@ -589,22 +589,22 @@ def build_prompt(
             "Do NOT write anything outside these two tags."
         )
 
-# ---- Failure context block ----
-failure_block = ""
-if last_failed_source is not None:
-    MAX_FAILED_CHARS = 2000
-    failed_display = last_failed_source
-    if len(last_failed_source) > MAX_FAILED_CHARS:
-        # Only show the generate_signals function from the failed attempt,
-        # since that's the only part the LLM changed and needs to learn from.
-        gs_idx = last_failed_source.find("def generate_signals")
-        if gs_idx != -1:
-            failed_display = (
-                "# [indicator functions omitted — unchanged from baseline]\n\n"
-                + last_failed_source[gs_idx:]
-            )
-        else:
-            failed_display = last_failed_source[:MAX_FAILED_CHARS] + "\n# ... (truncated)"
+    # ---- Failure context block ----
+    failure_block = ""
+    if last_failed_source is not None:
+        MAX_FAILED_CHARS = 2000
+        failed_display = last_failed_source
+        if len(last_failed_source) > MAX_FAILED_CHARS:
+            # Only show the generate_signals function from the failed attempt,
+            # since that's the only part the LLM changed and needs to learn from.
+            gs_idx = last_failed_source.find("def generate_signals")
+            if gs_idx != -1:
+                failed_display = (
+                    "# [indicator functions omitted — unchanged from baseline]\n\n"
+                    + last_failed_source[gs_idx:]
+                )
+            else:
+                failed_display = last_failed_source[:MAX_FAILED_CHARS] + "\n# ... (truncated)"
 
     failure_block = (
         f"\n--- YOUR LAST ATTEMPT (score={last_failed_score:.5f}, NOT an improvement) ---\n"
