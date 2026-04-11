@@ -9,13 +9,19 @@ as its live instruction manual at the start of every iteration.
 
 To set up a new AutoFin run:
 
-1. Agree on a run tag based on today's date (e.g. `apr8`).
-2. Check that `strategy.py` exists and is syntactically valid — run it directly
-   to confirm it imports cleanly: `python strategy.py`
-3. Verify market data can be fetched (the harness handles this automatically via
-   `yfinance`).
-4. Initialise `results.tsv` with just the header row — the baseline will be
+1. Agree on a run tag based on today's date (e.g. `apr12`).
+2. Check that `strategy.py` exists and is syntactically valid:
+   `python strategy.py`
+3. Initialise `results.tsv` with just the header row — the baseline will be
    recorded after the very first run.
+4. Start the harness. Recommended Colab command:
+   ```
+   python backtest_harness.py \
+     --tickers "NVDA,^GSPC,MSFT,GLD" \
+     --model "Qwen/Qwen3.5-9B" \
+     --device cuda \
+     --iterations 30
+   ```
 5. Confirm setup and go.
 
 ---
@@ -47,7 +53,7 @@ scores it, and feeds results back. The LLM **never sees `backtest_harness.py`**.
 - Change any parameter values inside the `ICHIMOKU_PARAMS`, `RSI_PARAMS`,
   `ATR_PARAMS`, and `VWAP_PARAMS` dicts.
 - Change the entry/exit logic inside `generate_signals()`.
-- Adjust thresholds, add derived intermediate signals, tune position sizing.
+- Add intermediate derived signals (using only numpy/pandas/math — no new imports).
 
 ## What You CANNOT Do
 
@@ -77,12 +83,11 @@ Returns a DataFrame with columns:
 - **Long bias**: `bullish == True` (price above cloud)
 - **Short bias**: `bearish == True` (price below cloud)
 - Defaults: `conversion_period=9, base_period=26, lagging_span2_period=52, displacement=26`
+- You can also use `tenkan_sen > kijun_sen` as a secondary momentum signal.
 
-> **Warm-up note**: the full Ichimoku cloud (senkou_span_b) requires
-> `lagging_span2_period + displacement` bars to initialise — 78 bars at defaults.
-> The harness prepends a 100-day warm-up buffer to every monthly shard so your
-> indicators are fully ready from the first bar of the evaluation window.
-> You do not need to handle this yourself.
+> **Warm-up note**: the full Ichimoku cloud requires `lagging_span2_period + displacement`
+> bars to initialise — 78 bars at defaults. The harness prepends a 100-day warm-up
+> buffer so your indicators are fully ready from the first eval bar.
 
 ### 2. `rsi` — Momentum Filter
 
@@ -90,10 +95,12 @@ Returns a DataFrame with columns:
 rsi(df, period, overbought, oversold)
 ```
 
-Returns columns: `rsi_value`, `buy_signal` (RSI crossed up through `oversold`),
-`sell_signal` (RSI crossed down through `overbought`).
+Returns columns: `rsi_value`, `buy_signal` (RSI crossed UP through `oversold`),
+`sell_signal` (RSI crossed DOWN through `overbought`).
 
 - Defaults: `period=14, overbought=70, oversold=30`
+- Zone checks (e.g. `rsi_value < oversold + 15`) generate more signals than
+  strict crossovers on trending stocks.
 
 ### 3. `atr` — Volatility / Stop-Loss
 
@@ -104,7 +111,15 @@ atr(df, period, multiplier)
 Returns columns: `atr_value`, `long_stop` (close − multiplier × ATR),
 `short_stop` (close + multiplier × ATR).
 
-- Defaults: `period=14, multiplier=2.0`
+- Defaults: `period=14, multiplier=2.5`
+- **CRITICAL**: The ATR true range MUST use `close.shift(1)` for previous close.
+  Never use `(high - close)` or `(low - close)` directly. The harness validates this.
+- You can build **adaptive stops** using the ATR value and a rolling mean:
+  ```python
+  atr_ma = atr_["atr_value"].rolling(20).mean()
+  high_vol = atr_["atr_value"] > atr_ma * 1.5
+  adaptive_mult = np.where(high_vol, ATR_PARAMS["multiplier"] * 0.7, ATR_PARAMS["multiplier"])
+  ```
 
 ### 4. `vwap` — Volume Filter
 
@@ -119,48 +134,52 @@ Returns columns: `vwap_value`, `above_vwap` (bool), `below_vwap` (bool).
 
 ---
 
-## Default Entry / Exit Rules
+## Default Entry / Exit Rules (v2 baseline)
 
 These rules live inside `generate_signals()` and **you may change them**:
 
 ```
-LONG  entry : ichimoku bullish  AND  rsi buy_signal   AND  price > vwap
-LONG  exit  : rsi sell_signal   OR   price drops below atr long_stop
-SHORT entry : ichimoku bearish  AND  rsi sell_signal  AND  price < vwap
-SHORT exit  : rsi buy_signal    OR   price rises above atr short_stop
+LONG  entry : ichimoku bullish
+              AND tenkan_sen > kijun_sen   (momentum confirmation)
+              AND rsi_value < oversold+15  (mild pullback in uptrend)
+LONG  exit  : rsi sell_signal   OR  low < adaptive_stop
+
+SHORT entry : ichimoku bearish
+              AND tenkan_sen < kijun_sen   (momentum confirmation)
+              AND rsi_value > overbought-15
+SHORT exit  : rsi buy_signal    OR  high > adaptive_stop
 ```
 
-The default entry condition is intentionally strict (a "perfect storm" of three
-simultaneous signals). If you are seeing zero trades on most shards, **loosen at
-least one condition** — for example, drop the VWAP filter, or replace the RSI
-crossover signal with a zone check (`rsi_value < oversold` rather than a single
-crossover bar).
+The Tenkan/Kijun filter prevents entering during dead-cat bounces in sustained
+downtrends (this was the main cause of the 2022 losses in v1). If you are still
+getting zero trades, remove ONE condition at a time and test.
 
 ---
 
-## Evaluation Metric (fixed — lives in backtest_harness.py, do not try to change it)
+## Evaluation Metric (fixed — do not try to change it)
 
 ```
 score = Sharpe_Ratio × 0.6  +  Profit_Factor × 0.2  −  Max_Drawdown × 0.2
 ```
 
-- **Higher is better.**
-- `Max_Drawdown` is a positive decimal (0.25 = 25% drawdown).
-- `Profit_Factor` is clipped to `[0, 10]` to avoid infinite values.
-- `Sharpe_Ratio` is annualised (252 trading days, risk-free rate = 0).
+The **aggregate score** is the **mean across ALL tickers AND all yearly shards**.
+This prevents overfitting to a single momentum stock (e.g. NVDA in a bull year).
+Do NOT sacrifice out-of-sample performance (2023, 2024) or cross-asset
+generalisation for in-sample NVDA gains.
 
-The **aggregate score** is the mean across all valid shards. Do NOT sacrifice
-out-of-sample performance (2023, 2024 shards) for in-sample gains — watch both.
+### Ensemble Gate
+
+Before any new best is accepted, the candidate is tested on out-of-sample shards
+for non-primary tickers (e.g. ^GSPC, MSFT, GLD). If the mean OOS score across
+those tickers is below -0.30, the strategy is **rejected** even if the primary
+ticker aggregate improved. This catches NVDA-overfit strategies.
 
 ---
 
 ## Data Shards
 
-Shards are **yearly** windows (keyed `"YYYY"`), covering every calendar year
-from `start_year` through the end of the data. Each shard has a 100-day warm-up
-buffer prepended by the harness — you never see cold indicators.
-
-Example shard keys: `2018`, `2019`, ..., `2024`
+Shards are **yearly** windows (keyed `"YYYY"`) from `start_year` to end of data.
+Each shard has a 100-day warm-up buffer prepended.
 
 | Period | Character |
 |---|---|
@@ -172,9 +191,21 @@ Example shard keys: `2018`, `2019`, ..., `2024`
 | 2023 | **Out-of-sample** |
 | 2024 | **Out-of-sample (most recent)** |
 
-Because shards are yearly (~250 trading bars each), a strategy that generates
-zero trades in a year scores 0.0 for that shard. Watch the `Trades` column in
-the results table — if most shards show 0, your entry conditions are too strict.
+---
+
+## Diversity System
+
+If `no_improve >= 2`, the harness injects a **DIVERSITY REQUIREMENT** block into
+your prompt with two concrete structural ideas. You MUST try something
+structurally different — do not just re-tune a threshold value.
+
+Structural changes that have NOT been tried yet (attempt these before parameter tuning):
+- Use Tenkan/Kijun cross as the **primary** entry trigger (not cloud position)
+- Add a trailing stop that tightens after a trade has been open > 15 bars
+- Use RSI divergence: enter long when price lower-low but RSI higher-low
+- Volatility gate: skip entries entirely when ATR > 2x its 20-day average
+- Asymmetric RSI: long entry RSI < 35, short entry RSI > 68
+- Exit via cloud re-entry (price moves back inside cloud = trend weakening)
 
 ---
 
@@ -182,29 +213,22 @@ the results table — if most shards show 0, your entry conditions are too stric
 
 All else being equal, **simpler is better**.
 
-- A ~0 improvement that deletes or simplifies code → **keep it** (simplification win).
+- A ~0 improvement that simplifies code → **keep it**.
 - A large improvement with clean logic → **keep it**.
-- A small improvement (+0.001 score) that adds 20 lines of hacky code → probably
-  not worth it. Weigh the complexity cost honestly.
+- A +0.001 improvement with 30 lines of hacky code → probably not worth it.
 
 ---
 
 ## Rollback and Exploration Rules
 
-The harness uses a three-way outcome system each iteration:
-
 | Outcome | Condition | Action |
 |---|---|---|
-| **keep** | `aggregate > best_score` | Save as new best, update trigger |
-| **explore** | `aggregate == best_score` | Keep the mutated code live — let the LLM keep searching |
-| **discard** | `aggregate < best_score` | Roll back to `best_strategy.py`; pass the failed code to the LLM |
+| **keep** | `aggregate > best_score` AND ensemble gate passed | Save as new best |
+| **explore** | `aggregate == best_score` | Keep code live for further search |
+| **discard** | `aggregate < best_score` OR ensemble gate failed | Roll back |
 
-When a strategy is **discarded**, the harness sends you your failed code in the
-next prompt under the heading `YOUR LAST ATTEMPT`. Study it carefully — do NOT
-repeat the same change. Propose something meaningfully different.
-
-When in **explore** mode (flat score), your code is kept live. This lets you
-accumulate incremental improvements even when starting from 0.0.
+When discarded, the harness sends your failed code in the next prompt under
+`YOUR LAST ATTEMPT`. Study it — do NOT repeat the same change.
 
 ---
 
@@ -213,43 +237,29 @@ accumulate incremental improvements even when starting from 0.0.
 **LOOP FOREVER:**
 
 1. Read `program.md` (this file) and `strategy.py`.
-2. Examine the per-shard results table and aggregate score from the harness.
-3. Identify the weakest shards. Think about why: is the strategy over-trading in
-   volatile regimes? Are stops too tight in the COVID crash months? Are signals
-   too rare in 2022?
-4. If you see a `YOUR LAST ATTEMPT` block, understand why it failed before
-   proposing a new approach.
+2. Examine the per-ticker per-shard heatmap and aggregate score.
+3. Identify the weakest tickers/shards. Think about why:
+   - Is the strategy long-only in bear markets (2022)?
+   - Are stops getting hit too fast in high-volatility periods (2020)?
+   - Does it work on NVDA but fail on ^GSPC (overfitting)?
+4. If you see a `YOUR LAST ATTEMPT` block or a DIVERSITY REQUIREMENT, respond
+   to those constraints first before proposing.
 5. Propose a new `strategy.py` with a hypothesis-driven change.
-6. Respond in the required format (below).
-7. The harness will:
-   - Execute the new `strategy.py`
-   - Score it on all yearly shards
-   - **Keep** if aggregate improved, **Explore** if flat, **Discard** if worse
-   - Log to `results.tsv` with status `keep`, `explore`, `discard`, or `crash`
-   - Feed you the results for the next iteration
-
-**The first iteration** always runs the **unmodified baseline** to establish a
-reference. Do not change anything on iteration 1 — just output the current
-`strategy.py` unchanged.
+6. Respond in the required format.
 
 **NEVER STOP**: Do not ask whether to continue. Do not pause for confirmation.
-Run until manually interrupted. If you exhaust obvious ideas, try: relaxing the
-entry conditions one at a time, replacing RSI crossover with RSI zone checks,
-using the Ichimoku kijun/tenkan cross as a secondary signal, adjusting the ATR
-multiplier for different market regimes, or asymmetric long/short thresholds.
 
 ---
 
 ## Crash / Failure Handling
 
-- **Syntax error**: The harness rejects your code and re-runs the previous best.
-  Fix the syntax in your next proposal.
-- **Zero trades on most shards**: Your entry condition is too strict for a
-  yearly window (~250 bars). Drop or relax at least one filter.
-- **Profit_Factor = 10.0** (capped): The strategy may have no losing trades in
-  that shard — check if ATR stop is unrealistically wide.
-- **Score = -99.0**: A runtime exception occurred. The harness logs the error; fix
-  the logic in your next proposal.
+- **Syntax error**: Fix in next proposal.
+- **ATR formula error**: True range MUST use `close.shift(1)`. Fix immediately.
+- **Zero trades**: Loosen at least one entry condition.
+- **Profit_Factor = 10.0** (capped): ATR stop may be unrealistically wide.
+- **Ensemble gate rejected**: Strategy fits NVDA but not other assets. Add regime
+  filtering or loosen conditions so it generalises.
+- **Score = -99.0**: Runtime exception. Fix the logic.
 
 ---
 
@@ -259,11 +269,12 @@ Respond with **exactly two XML sections** and nothing else:
 
 ```
 <reasoning>
-Concise explanation (≤ 150 words) of what you changed and why, referencing:
-  - The previous aggregate score
-  - Which yearly shards were weakest and why you think so
+Concise explanation (150 words max) referencing:
+  - The previous aggregate score (across all tickers)
+  - Which tickers/shards were weakest and why
   - What specifically you changed and the hypothesis
-  - (If applicable) Why your last attempt failed and what you are doing differently
+  - (If applicable) Why your last attempt failed and what you're doing differently
+  - (If DIVERSITY REQUIREMENT shown) Which structural idea you're implementing
 </reasoning>
 
 <strategy>
@@ -272,28 +283,22 @@ Concise explanation (≤ 150 words) of what you changed and why, referencing:
 ```
 
 **Hard rules for the `<strategy>` block:**
-- No markdown fences (no triple backticks anywhere inside the block).
+- No markdown fences (no triple backticks).
 - Must be the **complete file**, not a diff or partial snippet.
-- All four indicator functions must be present with their original implementations.
+- All four indicator functions must be present with their ORIGINAL implementations.
 - `generate_signals(df: pd.DataFrame) -> pd.DataFrame` signature must not change.
-- `get_params() -> dict` must return a flat dict of all current parameter values.
+- `get_params() -> dict` must return a flat dict of ALL current parameter values.
 - Do not add new imports.
-- **CRITICAL — no name-shadowing inside generate_signals**: NEVER use the same
-  name for a local variable as a function defined at module level. This causes a
-  Python `UnboundLocalError` at runtime. Always use aliases with a trailing
-  underscore: `ichi = ichimoku_cloud(...)`, `rsi_ = rsi(...)`, `atr_ = atr(...)`,
-  `vwap_ = vwap(...)`. The baseline code follows this convention — copy it exactly.
-- **CRITICAL — generate_signals output guard:**
-  Your `generate_signals` MUST produce non-zero signals on NVDA data.
-  The baseline strategy uses `rsi_value < oversold + 15` (i.e. RSI < 45) as the
-  long entry RSI condition — NOT `rsi_value < oversold` (RSI < 30). The latter
-  almost never fires on a trending stock. If you tighten RSI thresholds too much,
-  you get zero trades and a score of 0.0. Always verify your entry conditions can
-  realistically fire on a momentum stock.
+- **CRITICAL — no name-shadowing**: Use `ichi = ichimoku_cloud(...)`,
+  `rsi_ = rsi(...)`, `atr_ = atr(...)`, `vwap_ = vwap(...)`.
+- **CRITICAL — ATR formula**: Use `prev_close = df["Close"].shift(1)` and
+  `(df["High"] - prev_close).abs()`. NEVER `(high - close)` or `(low - close)`.
+- **CRITICAL — signals must fire**: Use `rsi_value < oversold + 15` (RSI < 45)
+  for long entry, not strict `rsi_value < oversold` (RSI < 30).
 
 ---
 
-## Parameter Search Space (reference bounds)
+## Parameter Search Space
 
 | Parameter | Sensible Min | Sensible Max | Note |
 |---|---|---|---|
@@ -316,6 +321,4 @@ When a new best score is found, the harness writes `push_trigger.json`:
 ```json
 { "score": 1.2345, "iteration": 7, "params": { ... }, "timestamp": "..." }
 ```
-An external MCP server (with a fine-grained GitHub token) watches this file and
-handles the commit and push. Neither `strategy.py` nor `backtest_harness.py`
-contain any git logic.
+An external MCP server watches this file and handles the commit and push.
