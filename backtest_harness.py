@@ -735,7 +735,24 @@ def log_jsonl(record: dict) -> None:
 # ---------------------------------------------------------------------------
 # GitHub push trigger
 # ---------------------------------------------------------------------------
-
+def sanitise_strategy_code(code: str) -> str:
+    """Clean common LLM output artifacts that cause syntax errors."""
+    replacements = {
+        "\u2018": "'",   # left single quote
+        "\u2019": "'",   # right single quote
+        "\u201c": '"',   # left double quote
+        "\u201d": '"',   # right double quote
+        "\u2014": "--",  # em-dash
+        "\u2013": "-",   # en-dash
+        "\u00a0": " ",   # non-breaking space
+        "\u2026": "...", # ellipsis
+    }
+    for bad, good in replacements.items():
+        code = code.replace(bad, good)
+    code = code.replace("\x00", "")
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in code.splitlines()]
+    return "\n".join(lines)
 def write_trigger(score: float, iteration: int, params: dict) -> None:
     payload = {
         "score":     score,
