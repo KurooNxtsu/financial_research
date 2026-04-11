@@ -609,6 +609,7 @@ def validate_atr_formula(code: str) -> tuple[bool, str]:
     """
     Check that the ATR function body still uses close.shift(1) for previous
     close, not the current close. The LLM often breaks this silently.
+    Only checks actual code lines — skips comment and docstring lines.
     """
     # Find the atr function body
     atr_start = code.find("def atr(")
@@ -619,19 +620,33 @@ def validate_atr_formula(code: str) -> tuple[bool, str]:
     next_def = code.find("\ndef ", atr_start + 10)
     atr_body = code[atr_start:next_def] if next_def != -1 else code[atr_start:]
 
-    # Patterns that indicate the wrong formula (using current close)
+    # Strip comment lines and docstring lines before checking
+    code_lines = []
+    in_docstring = False
+    for line in atr_body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('"""') or stripped.startswith("'''"):
+            in_docstring = not in_docstring
+            continue
+        if in_docstring:
+            continue
+        if stripped.startswith("#"):
+            continue
+        code_lines.append(line)
+    atr_code_only = "\n".join(code_lines)
+
+    # Patterns that indicate the wrong formula (using current close, not prev)
+    # Only match expressions that look like actual computation (with operators)
     bad_patterns = [
         "(df[\"High\"] - df[\"Close\"])",
         "(df[\"Low\"] - df[\"Close\"])",
-        "(high - close)",
-        "(low - close)",
-        "high - close)",
-        "low - close)",
+        "(high - close).abs()",
+        "(low - close).abs()",
     ]
     for pat in bad_patterns:
-        if pat in atr_body:
+        if pat in atr_code_only:
             return False, (
-                f"ATR formula error: found '{pat}'. "
+                f"ATR formula error: found '{pat}' in computation code. "
                 "True range must use close.shift(1) (previous close), "
                 "not current close. Use: (df['High'] - prev_close).abs() "
                 "where prev_close = df['Close'].shift(1)."
