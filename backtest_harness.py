@@ -641,7 +641,41 @@ def build_prompt(
         {"role": "user",   "content": user_content},
     ]
 
+def build_repair_prompt(
+    program_source: str,
+    failed_code: str,
+    validation_error: str,
+    error_type: str,  # "output", "contract", "syntax"
+    attempt: int,
+) -> list[dict]:
+    """
+    Prompt the LLM to fix a specific validation error in the strategy it just wrote.
+    Used in the inner repair loop — same iteration, different attempt.
+    """
+    user_content = (
+        f"=== REPAIR ATTEMPT {attempt} ===\n\n"
+        f"Your last strategy failed validation with this error:\n\n"
+        f"  Error type : {error_type}\n"
+        f"  Error      : {validation_error}\n\n"
+        f"Common causes by error type:\n"
+        f"  output/KeyError 'Close'  : You used signals['Close'] but 'Close' is only in df, not the merged indicator DataFrame. Use df['Close'] directly.\n"
+        f"  output/wrong columns     : generate_signals must return a DataFrame with a 'signal' column (int: 1=long, -1=short, 0=flat) and a 'stop' column. Do NOT return backtest results.\n"
+        f"  output/zero signals      : Your entry conditions never fire. Loosen at least one filter (e.g. RSI zone check instead of crossover).\n"
+        f"  contract/missing func    : You must have def generate_signals and def get_params in the file.\n"
+        f"  syntax                   : Fix the Python syntax error shown above.\n\n"
+        f"--- YOUR FAILING STRATEGY ---\n"
+        f"{failed_code}\n"
+        f"--- END OF FAILING STRATEGY ---\n\n"
+        f"Fix ONLY the error above. Keep everything else identical.\n"
+        f"Respond in EXACTLY this format with no text outside the tags:\n\n"
+        f"<reasoning>\nWhat was wrong and what you fixed (2-3 sentences max)\n</reasoning>\n"
+        f"<strategy>\nfull corrected Python code here\n</strategy>"
+    )
 
+    return [
+        {"role": "system", "content": program_source},
+        {"role": "user",   "content": user_content},
+    ]
 # ---------------------------------------------------------------------------
 # Response parser
 # ---------------------------------------------------------------------------
@@ -711,7 +745,31 @@ def write_trigger(score: float, iteration: int, params: dict) -> None:
     }
     TRIGGER_FILE.write_text(json.dumps(payload, indent=2))
     vlog("TRIGGER WRITTEN", f"push_trigger.json updated\n{json.dumps(payload, indent=2)}")
+def _run_llm_repair(pipe, messages: list[dict], vlog_fn) -> Optional[str]:
+    """
+    Run one LLM repair generation and return the extracted strategy string,
+    or None if generation or parsing failed.
+    """
+    try:
+        torch.cuda.empty_cache()
+        formatted = pipe.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        outputs    = pipe(formatted)
+        llm_output = outputs[0]["generated_text"]
+        vlog_fn("REPAIR LLM OUTPUT", f"Length: {len(llm_output)} chars\n\n{llm_output[:2000]}")
+    except Exception as exc:
+        vlog_fn("REPAIR LLM ERROR", f"Exception: {exc}\n\n{traceback.format_exc()}")
+        return None
 
+    _, strategy = parse_llm_response(llm_output)
+    if strategy:
+        strategy, _ = auto_repair_strategy(strategy)
+        strategy    = sanitise_strategy_code(strategy)   # if you added this from prior advice
+    return strategy
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -1044,14 +1102,113 @@ def run(
             f"Output error : {output_err or 'none'}"
         )
 
-        if not output_ok:
-            print(f"[validate] Output check failed — {output_err}. Keeping current best.")
-            append_results_tsv(iteration + 1, 0.0, "crash", f"output check: {output_err}", {})
+# ---- Validate + inner repair loop ----
+        MAX_REPAIR_ATTEMPTS = 3
+        repair_attempt      = 0
+        candidate_code      = new_strategy
+
+        while repair_attempt < MAX_REPAIR_ATTEMPTS:
+            repair_attempt += 1
+
+            syntax_ok,   syntax_err   = validate_syntax(candidate_code)
+            contract_ok, contract_err = validate_strategy_contract(candidate_code)
+
+            vlog("VALIDATION",
+                f"Repair attempt  : {repair_attempt}/{MAX_REPAIR_ATTEMPTS}\n"
+                f"Syntax OK       : {syntax_ok}\n"
+                f"Syntax error    : {syntax_err or 'none'}\n"
+                f"Contract OK     : {contract_ok}\n"
+                f"Contract error  : {contract_err or 'none'}"
+            )
+
+            # --- Syntax failure ---
+            if not syntax_ok:
+                vlog("REPAIR NEEDED", f"Syntax error: {syntax_err}")
+                if repair_attempt >= MAX_REPAIR_ATTEMPTS:
+                    print(f"[repair] Syntax unfixable after {MAX_REPAIR_ATTEMPTS} attempts. Skipping.")
+                    candidate_code = None
+                    break
+                repair_messages = build_repair_prompt(
+                    program_source   = program_source,
+                    failed_code      = candidate_code,
+                    validation_error = syntax_err,
+                    error_type       = "syntax",
+                    attempt          = repair_attempt,
+                )
+                candidate_code = _run_llm_repair(pipe, repair_messages, vlog)
+                if candidate_code is None:
+                    break
+                continue
+
+            # --- Contract failure ---
+            if not contract_ok:
+                vlog("REPAIR NEEDED", f"Contract error: {contract_err}")
+                if repair_attempt >= MAX_REPAIR_ATTEMPTS:
+                    print(f"[repair] Contract unfixable after {MAX_REPAIR_ATTEMPTS} attempts. Skipping.")
+                    candidate_code = None
+                    break
+                repair_messages = build_repair_prompt(
+                    program_source   = program_source,
+                    failed_code      = candidate_code,
+                    validation_error = contract_err,
+                    error_type       = "contract",
+                    attempt          = repair_attempt,
+                )
+                candidate_code = _run_llm_repair(pipe, repair_messages, vlog)
+                if candidate_code is None:
+                    break
+                continue
+
+            # --- Output validation ---
+            TEMP_FILE = ROOT / "strategy_candidate.py"
+            TEMP_FILE.write_text(candidate_code)
+            validation_df = list(shards.values())[-1]
+            output_ok, output_err = validate_strategy_output(TEMP_FILE, validation_df)
             TEMP_FILE.unlink(missing_ok=True)
+
+            vlog("VALIDATION OUTPUT",
+                f"Repair attempt : {repair_attempt}/{MAX_REPAIR_ATTEMPTS}\n"
+                f"Output OK      : {output_ok}\n"
+                f"Output error   : {output_err or 'none'}"
+            )
+
+            if output_ok:
+                vlog("VALIDATION PASSED", f"Passed on repair attempt {repair_attempt}")
+                break  # success — exit repair loop
+
+            # Output failed — repair if attempts remain
+            if repair_attempt >= MAX_REPAIR_ATTEMPTS:
+                print(f"[repair] Output check unfixable after {MAX_REPAIR_ATTEMPTS} attempts. Skipping.")
+                candidate_code = None
+                break
+
+            vlog("REPAIR NEEDED", f"Output error: {output_err}")
+            repair_messages = build_repair_prompt(
+                program_source   = program_source,
+                failed_code      = candidate_code,
+                validation_error = output_err,
+                error_type       = "output",
+                attempt          = repair_attempt,
+            )
+            candidate_code = _run_llm_repair(pipe, repair_messages, vlog)
+            if candidate_code is None:
+                break
+
+        # If all repair attempts exhausted, skip to next iteration
+        if candidate_code is None:
+            print("[repair] All repair attempts failed. Keeping current best.")
+            append_results_tsv(iteration, 0.0, "crash", "repair loop exhausted", {})
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
             continue
 
+        # ---- Write validated code ----
+        STRATEGY_FILE.write_text(candidate_code)
+        vlog("STRATEGY WRITTEN",
+            f"Written to : {STRATEGY_FILE}\n"
+            f"Length     : {len(candidate_code)} chars"
+        )
+        print("[strategy] strategy.py updated for next iteration.")
         TEMP_FILE.unlink(missing_ok=True)
 
         # ---- Write ----
