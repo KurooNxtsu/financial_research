@@ -329,7 +329,7 @@ def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool,
     try:
         strat = load_strategy(path)
         signals = strat.generate_signals(df_sample)
-        signals = normalise_signals(signals)          # <-- ADD THIS LINE
+        signals = normalise_signals(signals)
 
         if "signal" not in signals.columns:
             return False, "no 'signal' column after normalisation"
@@ -349,19 +349,6 @@ def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool,
         transitions = (signals["signal"].diff().abs() > 0).sum()
         if transitions < 2:
             return False, f"only {transitions} signal transitions — not a real strategy"
-        for name in ["rsi", "atr", "vwap", "ichimoku_cloud"]:
-            if f"\n    {name} = {name}(" in code:
-                return False, (
-                    f"name-shadowing: '{name}' shadows module-level function. "
-                    f"Use '{name}_' alias instead."
-                )
-            # Also catch the pattern: vwap = vwap_["..."]  (assigning to bare function name)
-            if f"\n    {name} = {name}_[" in code:
-                return False, (
-                    f"name-shadowing: '{name}' is a module-level function — "
-                    f"don't assign to it. Use a different variable name like '{name}_val'."
-                )
-    return True, ""
 
         return True, f"ok — {n_active} active bars, {transitions} transitions"
 
@@ -474,23 +461,24 @@ def validate_syntax(code: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+
 def validate_strategy_contract(code: str) -> tuple[bool, str]:
-    """Check that the code defines generate_signals and get_params, and has no shadowing bugs."""
     if "def generate_signals" not in code:
         return False, "missing generate_signals function"
     if "def get_params" not in code:
         return False, "missing get_params function"
-    # Catch common name-shadowing that causes UnboundLocalError at runtime.
-    # The LLM sometimes writes `rsi = rsi(df, ...)` inside generate_signals,
-    # which shadows the module-level function and causes a crash on the second call.
     for name in ["rsi", "atr", "vwap", "ichimoku_cloud"]:
         if f"\n    {name} = {name}(" in code:
             return False, (
-                f"name-shadowing detected: local variable '{name}' shadows "
-                f"the module-level function '{name}'. Use an alias like '{name}_ = {name}(...)' instead."
+                f"name-shadowing: '{name}' shadows module-level function. "
+                f"Use '{name}_' alias instead."
+            )
+        if f"\n    {name} = {name}_[" in code:
+            return False, (
+                f"name-shadowing: '{name}' is a module-level function — "
+                f"don't assign to it. Use a different variable name like '{name}_val'."
             )
     return True, ""
-
 
 # ---------------------------------------------------------------------------
 # LLM pipeline
