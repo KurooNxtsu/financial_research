@@ -326,15 +326,10 @@ def composite_score(sharpe: float, pf: float, mdd: float) -> float:
 
 
 def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool, str]:
-    """
-    Run generate_signals on a small sample and verify:
-    1. Returns a DataFrame with a 'signal' column (after normalisation)
-    2. Produces at least 1 non-zero signal (not a do-nothing strategy)
-    """
     try:
         strat = load_strategy(path)
         signals = strat.generate_signals(df_sample)
-        signals = normalise_signals(signals)
+        signals = normalise_signals(signals)          # <-- ADD THIS LINE
 
         if "signal" not in signals.columns:
             return False, "no 'signal' column after normalisation"
@@ -354,12 +349,24 @@ def validate_strategy_output(path: Path, df_sample: pd.DataFrame) -> tuple[bool,
         transitions = (signals["signal"].diff().abs() > 0).sum()
         if transitions < 2:
             return False, f"only {transitions} signal transitions — not a real strategy"
+        for name in ["rsi", "atr", "vwap", "ichimoku_cloud"]:
+            if f"\n    {name} = {name}(" in code:
+                return False, (
+                    f"name-shadowing: '{name}' shadows module-level function. "
+                    f"Use '{name}_' alias instead."
+                )
+            # Also catch the pattern: vwap = vwap_["..."]  (assigning to bare function name)
+            if f"\n    {name} = {name}_[" in code:
+                return False, (
+                    f"name-shadowing: '{name}' is a module-level function — "
+                    f"don't assign to it. Use a different variable name like '{name}_val'."
+                )
+    return True, ""
 
         return True, f"ok — {n_active} active bars, {transitions} transitions"
 
     except Exception as exc:
         return False, str(exc)
-
 
 def evaluate_shard(shard: pd.DataFrame, generate_signals_fn, shard_key: str) -> dict:
     """
@@ -775,7 +782,7 @@ def _run_llm_repair(pipe, messages: list[dict], vlog_fn) -> Optional[str]:
             add_generation_prompt=True,
             chat_template_kwargs={"enable_thinking": False},
         )
-        outputs    = pipe(formatted)
+        outputs    = pipe(formatted,max_new_tokens=10000)
         llm_output = outputs[0]["generated_text"]
         vlog_fn("REPAIR LLM OUTPUT", f"Length: {len(llm_output)} chars\n\n{llm_output[:2000]}")
     except Exception as exc:
