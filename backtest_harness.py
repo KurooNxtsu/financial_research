@@ -479,7 +479,6 @@ def validate_strategy_contract(code: str) -> tuple[bool, str]:
                 f"don't assign to it. Use a different variable name like '{name}_val'."
             )
     return True, ""
-
 # ---------------------------------------------------------------------------
 # LLM pipeline
 # ---------------------------------------------------------------------------
@@ -786,7 +785,6 @@ def _run_llm_repair(pipe, messages: list[dict], vlog_fn) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-
 def run(
     ticker:     str,
     start:      str,
@@ -827,7 +825,6 @@ def run(
     last_failed_source: Optional[str]  = None
     last_failed_score:  Optional[float] = None
 
-    # Stale-detection: skip LLM call if metrics are identical for N iterations
     last_shard_metrics = None
     stale_count        = 0
     MAX_STALE          = 3
@@ -980,7 +977,7 @@ def run(
             vlog("PLATEAU", f"no_improve={no_improve} >= patience={patience}. Stopping.")
             break
 
-        # Skip LLM call if metrics have been stale too long
+        # ---- Skip LLM if stale ----
         if stale_count >= MAX_STALE:
             vlog("STALE SKIP LLM", "Skipping LLM generation this iteration due to flat metrics.")
             continue
@@ -1081,40 +1078,10 @@ def run(
                 "This indicates truncation; consider reducing prompt size further."
             )
 
-        # ---- Validate ----
-        syntax_ok, syntax_err     = validate_syntax(new_strategy)
-        contract_ok, contract_err = validate_strategy_contract(new_strategy)
+        # ---- Sanitise ----
+        new_strategy = sanitise_strategy_code(new_strategy)
 
-        vlog("VALIDATION",
-            f"Syntax OK       : {syntax_ok}\n"
-            f"Syntax error    : {syntax_err or 'none'}\n"
-            f"Contract OK     : {contract_ok}\n"
-            f"Contract error  : {contract_err or 'none'}"
-        )
-
-        if not syntax_ok:
-            print(f"[parse] Syntax error — keeping current best. Error: {syntax_err}")
-            append_results_tsv(iteration + 1, 0.0, "crash", f"syntax error: {syntax_err[:80]}", {})
-            continue
-
-        if not contract_ok:
-            print(f"[parse] Contract error — {contract_err}. Keeping current best.")
-            append_results_tsv(iteration + 1, 0.0, "crash", f"contract error: {contract_err}", {})
-            continue
-
-        # ---- Validate output ----
-        # Write to a temp file so we can load and run it without clobbering strategy.py
-        TEMP_FILE = ROOT / "strategy_candidate.py"
-        TEMP_FILE.write_text(new_strategy)
-        validation_df = list(shards.values())[-1]  # use 2024 shard
-        output_ok, output_err = validate_strategy_output(TEMP_FILE, validation_df)
-
-        vlog("VALIDATION OUTPUT",
-            f"Output OK    : {output_ok}\n"
-            f"Output error : {output_err or 'none'}"
-        )
-
-# ---- Validate + inner repair loop ----
+        # ---- Validate + inner repair loop ----
         MAX_REPAIR_ATTEMPTS = 3
         repair_attempt      = 0
         candidate_code      = new_strategy
@@ -1186,9 +1153,8 @@ def run(
 
             if output_ok:
                 vlog("VALIDATION PASSED", f"Passed on repair attempt {repair_attempt}")
-                break  # success — exit repair loop
+                break
 
-            # Output failed — repair if attempts remain
             if repair_attempt >= MAX_REPAIR_ATTEMPTS:
                 print(f"[repair] Output check unfixable after {MAX_REPAIR_ATTEMPTS} attempts. Skipping.")
                 candidate_code = None
@@ -1206,7 +1172,7 @@ def run(
             if candidate_code is None:
                 break
 
-        # If all repair attempts exhausted, skip to next iteration
+        # ---- If all repair attempts exhausted, skip to next iteration ----
         if candidate_code is None:
             print("[repair] All repair attempts failed. Keeping current best.")
             append_results_tsv(iteration, 0.0, "crash", "repair loop exhausted", {})
@@ -1218,17 +1184,8 @@ def run(
         STRATEGY_FILE.write_text(candidate_code)
         vlog("STRATEGY WRITTEN",
             f"Written to : {STRATEGY_FILE}\n"
-            f"Length     : {len(candidate_code)} chars"
-        )
-        print("[strategy] strategy.py updated for next iteration.")
-        TEMP_FILE.unlink(missing_ok=True)
-
-        # ---- Write ----
-        STRATEGY_FILE.write_text(new_strategy)
-        vlog("STRATEGY WRITTEN",
-            f"Written to : {STRATEGY_FILE}\n"
-            f"Length     : {len(new_strategy)} chars\n\n"
-            f"--- CONTENT ---\n{new_strategy}"
+            f"Length     : {len(candidate_code)} chars\n\n"
+            f"--- CONTENT ---\n{candidate_code}"
         )
         print("[strategy] strategy.py updated for next iteration.")
 
@@ -1249,7 +1206,6 @@ def run(
     print(f"  Full JSONL log       : {LOG_FILE}")
     print(f"  Verbose log          : {VERBOSE_LOG}")
     print(f"{'='*62}")
-
 
 # ---------------------------------------------------------------------------
 # CLI
