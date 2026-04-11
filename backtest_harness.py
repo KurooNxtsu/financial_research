@@ -243,7 +243,7 @@ def normalise_signals(signals: pd.DataFrame) -> pd.DataFrame:
 # Trade simulator  (fixed — do not modify)
 # ---------------------------------------------------------------------------
 
-def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> /pd.DataFrame:
     # --- Normalise signal column ---
     if "signal" not in signals.columns:
         cols = set(signals.columns)
