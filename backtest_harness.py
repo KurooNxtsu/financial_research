@@ -491,7 +491,7 @@ def build_llm_pipeline(model_id: str, device: str):
             model=model,
             tokenizer=tokenizer,
             max_new_tokens=4096,
-            temperature=0.4,   /    # recommended for non-thinking general tasks
+            temperature=0.4,       # recommended for non-thinking general tasks
             top_p=0.8,             # recommended value from model card
             do_sample=True,
             return_full_text=False,
