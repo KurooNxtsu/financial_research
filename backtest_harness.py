@@ -62,6 +62,25 @@ VERBOSE_LOG   = ROOT / "verbose.log"
 # slow indicators (Ichimoku span_b needs 52+26 = 78 bars) are warm.
 WARMUP_DAYS = 100
 
+# Boilerplate appended when get_params is missing due to truncation
+GET_PARAMS_BOILERPLATE = '''
+
+STRATEGY_NAME    = "AutoFin-v1"
+STRATEGY_VERSION = "1.0.0"
+
+
+def get_params() -> dict:
+    """Return a flat dict of all current parameter values for logging."""
+    return {
+        **{f"ichi_{k}": v for k, v in ICHIMOKU_PARAMS.items()},
+        **{f"rsi_{k}":  v for k, v in RSI_PARAMS.items()},
+        **{f"atr_{k}":  v for k, v in ATR_PARAMS.items()},
+        **{f"vwap_{k}": v for k, v in VWAP_PARAMS.items()},
+        "strategy_name":    STRATEGY_NAME,
+        "strategy_version": STRATEGY_VERSION,
+    }
+'''
+
 # ---------------------------------------------------------------------------
 # Verbose logger
 # ---------------------------------------------------------------------------
@@ -219,6 +238,7 @@ def normalise_signals(signals: pd.DataFrame) -> pd.DataFrame:
         )
 
     return signals
+
 # ---------------------------------------------------------------------------
 # Trade simulator  (fixed — do not modify)
 # ---------------------------------------------------------------------------
@@ -227,7 +247,7 @@ def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
     # --- Normalise signal column ---
     if "signal" not in signals.columns:
         cols = set(signals.columns)
-        
+
         # Handle long_entry / long_exit / short_entry / short_exit pattern
         if {"long_entry", "long_exit", "short_entry", "short_exit"}.issubset(cols):
             position = 0
@@ -448,11 +468,20 @@ def validate_syntax(code: str) -> tuple[bool, str]:
 
 
 def validate_strategy_contract(code: str) -> tuple[bool, str]:
-    """Check that the code actually defines generate_signals and get_params."""
+    """Check that the code defines generate_signals and get_params, and has no shadowing bugs."""
     if "def generate_signals" not in code:
         return False, "missing generate_signals function"
     if "def get_params" not in code:
         return False, "missing get_params function"
+    # Catch common name-shadowing that causes UnboundLocalError at runtime.
+    # The LLM sometimes writes `rsi = rsi(df, ...)` inside generate_signals,
+    # which shadows the module-level function and causes a crash on the second call.
+    for name in ["rsi", "atr", "vwap", "ichimoku_cloud"]:
+        if f"\n    {name} = {name}(" in code:
+            return False, (
+                f"name-shadowing detected: local variable '{name}' shadows "
+                f"the module-level function '{name}'. Use an alias like '{name}_ = {name}(...)' instead."
+            )
     return True, ""
 
 
@@ -487,21 +516,21 @@ def build_llm_pipeline(model_id: str, device: str):
     model.eval()
 
     pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=8192,
-            temperature=0.4,       # recommended for non-thinking general tasks
-            top_p=0.8,             # recommended value from model card
-            do_sample=True,
-            return_full_text=False,
-        )
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=6000,   # enough for full strategy; leaves room in context window
+        temperature=0.4,
+        top_p=0.8,
+        do_sample=True,
+        return_full_text=False,
+    )
 
     vlog("LLM LOADED",
         f"Model          : {model_id}\n"
         f"Quantization   : 4-bit NF4 double-quant\n"
-        f"max_new_tokens : 2048\n"
-        f"temperature    : 0.3\n"
+        f"max_new_tokens : 6000\n"
+        f"temperature    : 0.4\n"
         f"VRAM after load:\n{torch.cuda.memory_summary(abbreviated=True)}"
     )
     return pipe
@@ -553,7 +582,7 @@ def build_prompt(
     else:
         task_line = (
             f"The CURRENT BEST aggregate score is {aggregate_score:.5f}. "
-            "Propose an improved strategy.py.  /no_think\n\n\n\n"
+            "Propose an improved strategy.py. /no_think\n\n"
             "YOU MUST RESPOND IN EXACTLY THIS FORMAT — NO EXCEPTIONS:\n"
             "<reasoning>\nYour analysis here\n</reasoning>\n"
             "<strategy>\n# full python code here\n</strategy>\n\n"
@@ -571,13 +600,16 @@ def build_prompt(
             f"--- END OF LAST ATTEMPT ---\n"
         )
 
-# Only show the LLM the editable parts to save context tokens
+    # Only show the LLM the editable parts to save context tokens.
+    # The indicator function bodies are frozen — no need to include them in full.
     MAX_STRATEGY_CHARS = 4000
     strategy_display = strategy_source
     if len(strategy_source) > MAX_STRATEGY_CHARS:
-        strategy_display = strategy_source[:MAX_STRATEGY_CHARS] + \
-            "\n\n# ... (indicator function bodies omitted — do not modify them)\n" + \
-            "# Include all four indicator functions with their ORIGINAL implementations in your output."
+        strategy_display = (
+            strategy_source[:MAX_STRATEGY_CHARS]
+            + "\n\n# ... (indicator function bodies omitted — do not modify them)\n"
+            + "# Include all four indicator functions with their ORIGINAL implementations in your output."
+        )
 
     user_content = (
         f"=== ITERATION {iteration} ===\n\n"
@@ -619,6 +651,22 @@ def parse_llm_response(text: str) -> tuple[Optional[str], Optional[str]]:
         strategy = strategy.strip()
 
     return reasoning, strategy
+
+
+# ---------------------------------------------------------------------------
+# Auto-repair: append missing boilerplate when output is truncated
+# ---------------------------------------------------------------------------
+
+def auto_repair_strategy(code: str) -> tuple[str, bool]:
+    """
+    If the LLM output was truncated and is missing get_params / STRATEGY_NAME,
+    append the standard boilerplate so the contract check can pass.
+    Returns (repaired_code, was_repaired).
+    """
+    if "def get_params" not in code:
+        repaired = code.rstrip() + GET_PARAMS_BOILERPLATE
+        return repaired, True
+    return code, False
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +805,6 @@ def run(
             if stale_count >= MAX_STALE:
                 vlog("STALE SKIP", f"Skipping LLM call — metrics flat for {MAX_STALE} iterations.")
                 last_shard_metrics = current_metrics
-                # Still need to determine status and log before continuing
         else:
             stale_count = 0
         last_shard_metrics = current_metrics
@@ -851,6 +898,7 @@ def run(
             vlog("ITER1 SKIP", "Iteration 1: copying best_strategy.py directly, skipping LLM.")
             shutil.copy(BEST_FILE, STRATEGY_FILE)
             continue
+
         # ---- Build prompt ----
         strategy_source = STRATEGY_FILE.read_text()
 
@@ -880,11 +928,11 @@ def run(
 
         try:
             formatted = pipe.tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        chat_template_kwargs={"enable_thinking": False},  # Qwen3.5 syntax, different from Qwen3
-                    )
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template_kwargs={"enable_thinking": False},
+            )
             estimated_tokens = len(formatted) // 4
             vlog("LLM INPUT",
                 f"Formatted prompt length : {len(formatted)} chars\n"
@@ -935,6 +983,14 @@ def run(
             print("[parse] No <strategy> block found. Re-running current best next iteration.")
             continue
 
+        # ---- Auto-repair truncated output ----
+        new_strategy, was_repaired = auto_repair_strategy(new_strategy)
+        if was_repaired:
+            vlog("AUTO-REPAIR",
+                "Output was missing get_params — appended standard boilerplate.\n"
+                "This indicates truncation; consider reducing prompt size further."
+            )
+
         # ---- Validate ----
         syntax_ok, syntax_err     = validate_syntax(new_strategy)
         contract_ok, contract_err = validate_strategy_contract(new_strategy)
@@ -955,10 +1011,13 @@ def run(
             print(f"[parse] Contract error — {contract_err}. Keeping current best.")
             append_results_tsv(iteration + 1, 0.0, "crash", f"contract error: {contract_err}", {})
             continue
-        # ---- Validate output (new check) ----
-        # Use the largest shard as the validation sample
-        validation_df = list(shards.values())[-1]  # e.g. 2024 shard
-        output_ok, output_err = validate_strategy_output(STRATEGY_FILE, validation_df)
+
+        # ---- Validate output ----
+        # Write to a temp file so we can load and run it without clobbering strategy.py
+        TEMP_FILE = ROOT / "strategy_candidate.py"
+        TEMP_FILE.write_text(new_strategy)
+        validation_df = list(shards.values())[-1]  # use 2024 shard
+        output_ok, output_err = validate_strategy_output(TEMP_FILE, validation_df)
 
         vlog("VALIDATION OUTPUT",
             f"Output OK    : {output_ok}\n"
@@ -968,10 +1027,13 @@ def run(
         if not output_ok:
             print(f"[validate] Output check failed — {output_err}. Keeping current best.")
             append_results_tsv(iteration + 1, 0.0, "crash", f"output check: {output_err}", {})
-            # Roll back immediately
+            TEMP_FILE.unlink(missing_ok=True)
             if BEST_FILE.exists():
                 shutil.copy(BEST_FILE, STRATEGY_FILE)
             continue
+
+        TEMP_FILE.unlink(missing_ok=True)
+
         # ---- Write ----
         STRATEGY_FILE.write_text(new_strategy)
         vlog("STRATEGY WRITTEN",

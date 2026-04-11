@@ -156,11 +156,11 @@ out-of-sample performance (2023, 2024 shards) for in-sample gains — watch both
 
 ## Data Shards
 
-Shards are **monthly** windows (keyed `"YYYY-MM"`), covering every calendar month
+Shards are **yearly** windows (keyed `"YYYY"`), covering every calendar year
 from `start_year` through the end of the data. Each shard has a 100-day warm-up
 buffer prepended by the harness — you never see cold indicators.
 
-Example shard keys: `2018-01`, `2018-02`, ..., `2024-12`
+Example shard keys: `2018`, `2019`, ..., `2024`
 
 | Period | Character |
 |---|---|
@@ -172,8 +172,8 @@ Example shard keys: `2018-01`, `2018-02`, ..., `2024-12`
 | 2023 | **Out-of-sample** |
 | 2024 | **Out-of-sample (most recent)** |
 
-Because shards are monthly (~21 trading bars each), a strategy that generates
-zero trades in a month scores 0.0 for that shard. Watch the `Trades` column in
+Because shards are yearly (~250 trading bars each), a strategy that generates
+zero trades in a year scores 0.0 for that shard. Watch the `Trades` column in
 the results table — if most shards show 0, your entry conditions are too strict.
 
 ---
@@ -223,7 +223,7 @@ accumulate incremental improvements even when starting from 0.0.
 6. Respond in the required format (below).
 7. The harness will:
    - Execute the new `strategy.py`
-   - Score it on all monthly shards
+   - Score it on all yearly shards
    - **Keep** if aggregate improved, **Explore** if flat, **Discard** if worse
    - Log to `results.tsv` with status `keep`, `explore`, `discard`, or `crash`
    - Feed you the results for the next iteration
@@ -245,7 +245,7 @@ multiplier for different market regimes, or asymmetric long/short thresholds.
 - **Syntax error**: The harness rejects your code and re-runs the previous best.
   Fix the syntax in your next proposal.
 - **Zero trades on most shards**: Your entry condition is too strict for a
-  monthly window (~21 bars). Drop or relax at least one filter.
+  yearly window (~250 bars). Drop or relax at least one filter.
 - **Profit_Factor = 10.0** (capped): The strategy may have no losing trades in
   that shard — check if ATR stop is unrealistically wide.
 - **Score = -99.0**: A runtime exception occurred. The harness logs the error; fix
@@ -261,7 +261,7 @@ Respond with **exactly two XML sections** and nothing else:
 <reasoning>
 Concise explanation (≤ 150 words) of what you changed and why, referencing:
   - The previous aggregate score
-  - Which monthly shards were weakest and why you think so
+  - Which yearly shards were weakest and why you think so
   - What specifically you changed and the hypothesis
   - (If applicable) Why your last attempt failed and what you are doing differently
 </reasoning>
@@ -278,13 +278,18 @@ Concise explanation (≤ 150 words) of what you changed and why, referencing:
 - `generate_signals(df: pd.DataFrame) -> pd.DataFrame` signature must not change.
 - `get_params() -> dict` must return a flat dict of all current parameter values.
 - Do not add new imports.
--**CRITICAL — generate_signals output guard:**
-Your `generate_signals` MUST produce non-zero signals on NVDA data.
-The baseline strategy uses `rsi_value < oversold + 15` (i.e. RSI < 45) as the
-long entry RSI condition — NOT `rsi_value < oversold` (RSI < 30). The latter
-almost never fires on a trending stock. If you tighten RSI thresholds too much,
-you get zero trades and a score of 0.0. Always verify your entry conditions can
-realistically fire on a momentum stock.
+- **CRITICAL — no name-shadowing inside generate_signals**: NEVER use the same
+  name for a local variable as a function defined at module level. This causes a
+  Python `UnboundLocalError` at runtime. Always use aliases with a trailing
+  underscore: `ichi = ichimoku_cloud(...)`, `rsi_ = rsi(...)`, `atr_ = atr(...)`,
+  `vwap_ = vwap(...)`. The baseline code follows this convention — copy it exactly.
+- **CRITICAL — generate_signals output guard:**
+  Your `generate_signals` MUST produce non-zero signals on NVDA data.
+  The baseline strategy uses `rsi_value < oversold + 15` (i.e. RSI < 45) as the
+  long entry RSI condition — NOT `rsi_value < oversold` (RSI < 30). The latter
+  almost never fires on a trending stock. If you tighten RSI thresholds too much,
+  you get zero trades and a score of 0.0. Always verify your entry conditions can
+  realistically fire on a momentum stock.
 
 ---
 
