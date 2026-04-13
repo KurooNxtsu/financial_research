@@ -1,5 +1,5 @@
 """
-strategy.py  --  AutoFin Strategy Definition
+strategy.py  —  AutoFin Strategy Definition
 ============================================
 THIS FILE IS THE LLM's SOLE WRITABLE SURFACE.
 
@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# PARAMETER BLOCK -- LLM edits these values
+# PARAMETER BLOCK — LLM edits these values
 # ---------------------------------------------------------------------------
 
 ICHIMOKU_PARAMS = dict(
@@ -44,7 +44,7 @@ VWAP_PARAMS = dict(
 
 
 # ---------------------------------------------------------------------------
-# INDICATOR FUNCTIONS  (signatures are FIXED -- do not alter)
+# INDICATOR FUNCTIONS  (signatures are FIXED — do not alter)
 # ---------------------------------------------------------------------------
 
 def ichimoku_cloud(
@@ -135,32 +135,29 @@ def atr(
     multiplier: float,
 ) -> pd.DataFrame:
     """
-    Average True Range -- used for stop-loss placement.
+    Average True Range — used for stop-loss placement.
 
     Returns DataFrame with columns:
       atr_value   : raw ATR
       long_stop   : close - multiplier * ATR  (stop for long positions)
       short_stop  : close + multiplier * ATR  (stop for short positions)
+
+    CRITICAL: true range uses close.shift(1) for previous close.
+    Do NOT change (high - close) or (low - close) — that is wrong.
     """
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
-
-    prev_close = close.shift(1)
-
+    prev_close = df["Close"].shift(1)
     true_range = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"]  - prev_close).abs(),
     ], axis=1).max(axis=1)
 
-    atr_value = true_range.rolling(period).mean()
-
-    long_stop = close - multiplier * atr_value
-    short_stop = close + multiplier * atr_value
+    atr_val    = true_range.ewm(span=period, min_periods=period).mean()
+    long_stop  = df["Close"] - multiplier * atr_val
+    short_stop = df["Close"] + multiplier * atr_val
 
     return pd.DataFrame({
-        "atr_value":   atr_value,
+        "atr_value":   atr_val,
         "long_stop":   long_stop,
         "short_stop":  short_stop,
     }, index=df.index)
@@ -171,104 +168,161 @@ def vwap(
     period: int,
 ) -> pd.DataFrame:
     """
-    Volume Weighted Average Price.
+    Rolling Volume-Weighted Average Price.
 
     Returns DataFrame with columns:
-      vwap_value   : rolling VWAP
-      above_vwap   : True if price above VWAP
-      below_vwap   : True if price below VWAP
+      vwap_value  : rolling VWAP over `period` days
+      above_vwap  : True when close > VWAP
+      below_vwap  : True when close < VWAP
     """
-    close = df["Close"]
-    volume = df["Volume"]
-
-    typical_price = (df["High"] + df["Low"] + close) / 3
-    tp_cum = typical_price.cumsum()
-    vol_cum = volume.cumsum()
-
-    vwap_value = tp_cum / vol_cum
-
-    above_vwap = close > vwap_value
-    below_vwap = close < vwap_value
+    typical  = (df["High"] + df["Low"] + df["Close"]) / 3
+    vol      = df["Volume"].replace(0, np.nan)
+    vwap_val = (typical * vol).rolling(period).sum() / vol.rolling(period).sum()
 
     return pd.DataFrame({
-        "vwap_value":   vwap_value,
-        "above_vwap":   above_vwap,
-        "below_vwap":   below_vwap,
+        "vwap_value": vwap_val,
+        "above_vwap": df["Close"] > vwap_val,
+        "below_vwap": df["Close"] < vwap_val,
     }, index=df.index)
 
 
 # ---------------------------------------------------------------------------
-# SIGNAL GENERATION LOGIC -- LLM edits this
+# SIGNAL GENERATION — LLM may modify the logic inside this function
 # ---------------------------------------------------------------------------
 
 def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate entry/exit signals based on indicators.
+    Combine all four indicators into a position signal.
 
-    Returns DataFrame with columns:
-      long_entry, long_exit, short_entry, short_exit (all bool)
+    Returns a DataFrame with columns:
+      signal : int   — 1 = long, -1 = short, 0 = flat
+      stop   : float — active stop-loss price (NaN when flat)
+
+    Called by backtest_harness.py — signature is FIXED.
+    `df` must have columns: Open, High, Low, Close, Volume (DatetimeIndex).
+
+    REGIME-ADAPTIVE STOPS: ATR multiplier is tightened in high-volatility
+    regimes (current ATR > 1.5x its 20-day average) to reduce whipsaws.
+
+    TENKAN/KIJUN FILTER: entry requires Tenkan > Kijun (long) or
+    Tenkan < Kijun (short) as a secondary momentum confirmation.
+    This filters dead-cat bounces in sustained downtrends (e.g. 2022).
     """
-    ichi = ichimoku_cloud(df, **ICHIMOKU_PARAMS)
-    rsi_ = rsi(df, **RSI_PARAMS)
-    atr_ = atr(df, **ATR_PARAMS)
-    vwap_ = vwap(df, **VWAP_PARAMS)
+    ichi  = ichimoku_cloud(df, **ICHIMOKU_PARAMS)
+    rsi_  = rsi(df,           **RSI_PARAMS)
+    atr_  = atr(df,           **ATR_PARAMS)
+    vwap_ = vwap(df,          **VWAP_PARAMS)
 
-    # Adaptive stop based on ATR volatility
-    atr_ma = atr_["atr_value"].rolling(20).mean()
+    # --- Volatility regime: current ATR vs rolling 20-day average ---
+    atr_ma   = atr_["atr_value"].rolling(20).mean()
     high_vol = atr_["atr_value"] > atr_ma * 1.5
-    adaptive_mult = np.where(high_vol, ATR_PARAMS["multiplier"] * 0.7, ATR_PARAMS["multiplier"])
-    long_stop = df["Close"] - adaptive_mult * atr_["atr_value"]
-    short_stop = df["Close"] + adaptive_mult * atr_["atr_value"]
 
-    # Volatility gate: skip entries when ATR > 2x its 20-day average
-    atr_ma_20 = atr_["atr_value"].rolling(20).mean()
-    high_vol_gate = atr_["atr_value"] > atr_ma_20 * 2.0
+    # Tighten stops in high-vol regimes (multiplier * 0.7), keep normal otherwise
+    adaptive_mult  = np.where(high_vol, ATR_PARAMS["multiplier"] * 0.7,
+                                        ATR_PARAMS["multiplier"])
+    long_stop_adp  = df["Close"] - adaptive_mult * atr_["atr_value"]
+    short_stop_adp = df["Close"] + adaptive_mult * atr_["atr_value"]
 
-    # Long Entry: Ichimoku bullish AND tenkan > kijun AND RSI < 45 (mild pullback)
-    long_entry = (
-        (ichi["bullish"] == True) &
-        (ichi["tenkan_sen"] > ichi["kijun_sen"]) &
-        (rsi_["rsi_value"] < RSI_PARAMS["oversold"] + 15) &
-        (~high_vol_gate)
-    )
+    # --- Tenkan/Kijun cross for secondary momentum confirmation ---
+    tk_above_kijun = ichi["tenkan_sen"] > ichi["kijun_sen"]
+    tk_below_kijun = ichi["tenkan_sen"] < ichi["kijun_sen"]
 
-    # Long Exit: RSI sell signal OR price below long stop OR price re-enters cloud
-    long_exit = (
-        (rsi_["sell_signal"] == True) |
-        (df["Close"] < long_stop) |
-        (ichi["bearish"] == True)
-    )
+    n      = len(df)
+    signal = pd.Series(0,      index=df.index, dtype=int)
+    stop   = pd.Series(np.nan, index=df.index, dtype=float)
 
-    # Short Entry: Ichimoku bearish AND tenkan < kijun AND RSI > 65 (mild rally)
-    short_entry = (
-        (ichi["bearish"] == True) &
-        (ichi["tenkan_sen"] < ichi["kijun_sen"]) &
-        (rsi_["rsi_value"] > RSI_PARAMS["overbought"] - 15) &
-        (~high_vol_gate)
-    )
+    position    = 0
+    active_stop = np.nan
 
-    # Short Exit: RSI buy signal OR price above short stop OR price re-enters cloud
-    short_exit = (
-        (rsi_["buy_signal"] == True) |
-        (df["Close"] > short_stop) |
-        (ichi["bullish"] == True)
-    )
+    for i in range(1, n):
 
-    return pd.DataFrame({
-        "long_entry":   long_entry,
-        "long_exit":    long_exit,
-        "short_entry":  short_entry,
-        "short_exit":   short_exit,
-    }, index=df.index)
+        # ---- Stop-loss exit (checked first) ----
+        if position == 1 and df["Low"].iloc[i] < active_stop:
+            position    = 0
+            active_stop = np.nan
+        elif position == -1 and df["High"].iloc[i] > active_stop:
+            position    = 0
+            active_stop = np.nan
+
+        # ---- RSI-based exit ----
+        if position == 1  and rsi_["sell_signal"].iloc[i]:
+            position    = 0
+            active_stop = np.nan
+        if position == -1 and rsi_["buy_signal"].iloc[i]:
+            position    = 0
+            active_stop = np.nan
+
+        # ---- Entry (only when flat) ----
+        if position == 0:
+            long_entry = (
+                bool(ichi["bullish"].iloc[i])                               # price above cloud
+                and bool(tk_above_kijun.iloc[i])                            # tenkan > kijun: momentum confirmed
+                and rsi_["rsi_value"].iloc[i] < RSI_PARAMS["oversold"] + 15 # RSI < 45: mild pullback in uptrend
+                and not np.isnan(atr_["long_stop"].iloc[i])
+            )
+            short_entry = (
+                bool(ichi["bearish"].iloc[i])                                  # price below cloud
+                and bool(tk_below_kijun.iloc[i])                               # tenkan < kijun: momentum confirmed
+                and rsi_["rsi_value"].iloc[i] > RSI_PARAMS["overbought"] - 15  # RSI > 55: mild strength in downtrend
+                and bool(vwap_["below_vwap"].iloc[i])                          # ADDED: close < VWAP confirms real downtrend
+                and not np.isnan(atr_["short_stop"].iloc[i])
+            )
+
+            if long_entry:
+                position    = 1
+                active_stop = float(long_stop_adp.iloc[i])
+            elif short_entry:
+                position    = -1
+                active_stop = float(short_stop_adp.iloc[i])
+
+        signal.iloc[i] = position
+        stop.iloc[i]   = active_stop
+
+    return pd.DataFrame({"signal": signal, "stop": stop}, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# METADATA — used by the harness for logging and the GitHub trigger payload
+# ---------------------------------------------------------------------------
+
+STRATEGY_NAME    = "AutoFin-v2"
+STRATEGY_VERSION = "2.0.0"
 
 
 def get_params() -> dict:
-    """
-    Return all parameter values as a flat dict.
-    """
+    """Return a flat dict of all current parameter values for logging."""
     return {
-        **ICHIMOKU_PARAMS,
-        **RSI_PARAMS,
-        **ATR_PARAMS,
-        **VWAP_PARAMS,
+        **{f"ichi_{k}": v for k, v in ICHIMOKU_PARAMS.items()},
+        **{f"rsi_{k}":  v for k, v in RSI_PARAMS.items()},
+        **{f"atr_{k}":  v for k, v in ATR_PARAMS.items()},
+        **{f"vwap_{k}": v for k, v in VWAP_PARAMS.items()},
+        "strategy_name":    STRATEGY_NAME,
+        "strategy_version": STRATEGY_VERSION,
     }
+
+
+# ---------------------------------------------------------------------------
+# Quick self-test (run directly to confirm the file loads cleanly)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import pandas as pd
+    import numpy as np
+
+    np.random.seed(0)
+    n = 300
+    close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+    idx   = pd.date_range("2020-01-01", periods=n, freq="B")
+    df_test = pd.DataFrame({
+        "Open":   close * 0.999,
+        "High":   close * 1.005,
+        "Low":    close * 0.995,
+        "Close":  close,
+        "Volume": np.random.randint(1_000_000, 5_000_000, n),
+    }, index=idx)
+
+    sigs = generate_signals(df_test)
+    n_long  = (sigs["signal"] == 1).sum()
+    n_short = (sigs["signal"] == -1).sum()
+    print(f"Self-test passed: {n_long} long bars, {n_short} short bars over {n} days.")
+    print(f"Params: {get_params()}")
