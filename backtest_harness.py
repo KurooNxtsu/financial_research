@@ -26,6 +26,19 @@ Improvements vs original:
   - Each shard gets a 100-day warm-up buffer.
   - Rollback only on aggregate < best_score; explore when flat.
 
+  v2 IMPROVEMENTS:
+  - NO_THINK IN SYSTEM MESSAGE: /no_think prepended to system prompt to
+    suppress Qwen3 thinking block from consuming token budget.
+  - TRIMMED PROMPT: MAX_STRATEGY_CHARS reduced to 1800, MAX_FAILED_CHARS to
+    1200. Indicator bodies are omitted from context — the LLM never needs
+    to read ichimoku_cloud() internals to improve generate_signals().
+  - INCREASED max_new_tokens: 6000 -> 8000 in pipeline definition.
+  - NO-DF-JOIN VALIDATOR: new validate_no_df_joins() catches the common
+    mistake of joining indicator DataFrames (causes 'atr_value_atr' errors)
+    before spinning up a repair LLM call.
+  - REPAIR PROMPT ENHANCED: explicit anti-pattern block tells the LLM not
+    to join DataFrames and shows the correct access pattern.
+
 Usage:
     # Single ticker (original behaviour)
     python backtest_harness.py --ticker "NVDA" --device cuda --forever
@@ -654,6 +667,48 @@ def validate_atr_formula(code: str) -> tuple[bool, str]:
     return True, ""
 
 
+def validate_no_df_joins(code: str) -> tuple[bool, str]:
+    """
+    Catch the common LLM mistake of joining indicator DataFrames together
+    inside generate_signals(). This breaks column naming (e.g. 'atr_value'
+    becomes 'atr_value_atr' after a join with rsuffix='_atr'), causing
+    KeyError crashes that waste repair loop iterations.
+
+    Correct pattern: call each indicator separately and access columns directly.
+      ichi  = ichimoku_cloud(df, ...)
+      rsi_  = rsi(df, ...)
+      atr_  = atr(df, ...)
+      vwap_ = vwap(df, ...)
+      # Then use: ichi['bullish'], rsi_['rsi_value'], atr_['atr_value'], etc.
+
+    Wrong pattern (caught here):
+      ichi = ichi.join(rsi_, rsuffix='_rsi')   # DO NOT DO THIS
+    """
+    gs_start = code.find("def generate_signals")
+    if gs_start == -1:
+        return True, ""  # contract validator will catch missing function
+
+    gs_body = code[gs_start:]
+
+    bad_patterns = [
+        (".join(rsi",  "joining rsi_ DataFrame"),
+        (".join(atr",  "joining atr_ DataFrame"),
+        (".join(vwap", "joining vwap_ DataFrame"),
+        (".join(ichi", "joining ichi DataFrame"),
+        ("rsuffix=",   "use of rsuffix= indicates a DataFrame join"),
+        ("lsuffix=",   "use of lsuffix= indicates a DataFrame join"),
+    ]
+    for pat, desc in bad_patterns:
+        if pat in gs_body:
+            return False, (
+                f"structural_error: found '{pat}' ({desc}) inside generate_signals(). "
+                "Do NOT join indicator DataFrames — column names break. "
+                "Access each indicator's columns directly: "
+                "ichi['bullish'], rsi_['rsi_value'], atr_['atr_value'], vwap_['above_vwap']."
+            )
+    return True, ""
+
+
 def validate_strategy_output(
     path: Path,
     df_sample: pd.DataFrame,
@@ -718,13 +773,15 @@ def build_llm_pipeline(model_id: str, device: str):
     )
     model.eval()
 
-    # NOTE: temperature is set per-call in the generation step (scheduled).
-    # We set a placeholder here; actual temperature is passed at inference time.
+    # IMPROVEMENT: increased max_new_tokens from 6000 to 8000.
+    # The thinking block in Qwen3 was consuming token budget even with
+    # enable_thinking=False — the extra headroom ensures the <strategy>
+    # block is never truncated mid-code.
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=6000,
+        max_new_tokens=8000,
         do_sample=True,
         top_p=0.8,
         return_full_text=False,
@@ -817,18 +874,30 @@ def build_prompt(
         task_line = (
             f"The CURRENT BEST aggregate score is {aggregate_score:.5f} "
             f"(averaged across ALL tickers and shards). "
-            "Propose an improved strategy.py. /no_think\n\n"
+            "Propose an improved strategy.py.\n\n"
             "YOU MUST RESPOND IN EXACTLY THIS FORMAT:\n"
             "  <reasoning> ... your analysis ... </reasoning>\n"
             "  <strategy> ... full python code ... </strategy>\n\n"
             "Do NOT write anything outside these two tags.\n"
-            "The <strategy> block must be complete valid Python with NO markdown fences."
+            "The <strategy> block must be complete valid Python with NO markdown fences.\n\n"
+            "CRITICAL CODE RULES:\n"
+            "  1. Call each indicator SEPARATELY — do NOT join their DataFrames:\n"
+            "       ichi  = ichimoku_cloud(df, **ICHIMOKU_PARAMS)\n"
+            "       rsi_  = rsi(df, **RSI_PARAMS)\n"
+            "       atr_  = atr(df, **ATR_PARAMS)\n"
+            "       vwap_ = vwap(df, **VWAP_PARAMS)\n"
+            "     Then access: ichi['bullish'], rsi_['rsi_value'], atr_['atr_value'], etc.\n"
+            "     NEVER do ichi.join(rsi_) — column names will break.\n"
+            "  2. generate_signals MUST return pd.DataFrame({'signal': ..., 'stop': ...}).\n"
+            "  3. Use rsi_value < oversold+15 (not strict oversold) so signals fire.\n"
         )
 
     # ---- Failure context block ----
     failure_block = ""
     if last_failed_source is not None:
-        MAX_FAILED_CHARS = 2000
+        # IMPROVEMENT: reduced from 2000 to 1200 chars to save context budget.
+        # We show only the generate_signals body since that's what failed.
+        MAX_FAILED_CHARS = 1200
         failed_display = last_failed_source
         if len(last_failed_source) > MAX_FAILED_CHARS:
             gs_idx = last_failed_source.find("def generate_signals")
@@ -839,6 +908,9 @@ def build_prompt(
                 )
             else:
                 failed_display = last_failed_source[:MAX_FAILED_CHARS] + "\n# ... (truncated)"
+            # Final truncation to hard limit
+            if len(failed_display) > MAX_FAILED_CHARS:
+                failed_display = failed_display[:MAX_FAILED_CHARS] + "\n# ... (truncated)"
 
         failure_block = (
             f"\n--- YOUR LAST ATTEMPT (score={last_failed_score:.5f}, NOT an improvement) ---\n"
@@ -847,7 +919,11 @@ def build_prompt(
             f"--- END OF LAST ATTEMPT ---\n"
         )
 
-    MAX_STRATEGY_CHARS = 4000
+    # IMPROVEMENT: reduced from 4000 to 1800 chars.
+    # Indicator function bodies are omitted — the LLM doesn't need to read
+    # ichimoku_cloud() internals to improve generate_signals(). This saves
+    # ~1500 tokens per call, giving more room for the <strategy> output.
+    MAX_STRATEGY_CHARS = 1800
     strategy_display = strategy_source
     if len(strategy_source) > MAX_STRATEGY_CHARS:
         strategy_display = (
@@ -868,8 +944,13 @@ def build_prompt(
         f"{task_line}"
     )
 
+    # IMPROVEMENT: /no_think is now prepended to the SYSTEM message (not just
+    # the task line) so it applies globally and suppresses the Qwen3 thinking
+    # block from consuming token budget on every call.
+    system_content = "/no_think\n\n" + program_source
+
     return [
-        {"role": "system", "content": program_source},
+        {"role": "system", "content": system_content},
         {"role": "user",   "content": user_content},
     ]
 
@@ -887,11 +968,19 @@ def build_repair_prompt(
         f"  Error type : {error_type}\n"
         f"  Error      : {validation_error}\n\n"
         f"Common causes by error type:\n"
-        f"  atr_formula  : ATR must use close.shift(1) for previous close.\n"
-        f"                 Use (df['High'] - prev_close).abs() NOT (high - close).abs().\n"
-        f"  output/zero  : Entry conditions too strict. Loosen RSI or Ichimoku filter.\n"
-        f"  contract     : generate_signals and get_params must both be present.\n"
-        f"  syntax       : Fix the Python syntax error shown above.\n\n"
+        f"  atr_formula     : ATR must use close.shift(1) for previous close.\n"
+        f"                    Use (df['High'] - prev_close).abs() NOT (high - close).abs().\n"
+        f"  output/zero     : Entry conditions too strict. Loosen RSI or Ichimoku filter.\n"
+        f"  contract        : generate_signals and get_params must both be present.\n"
+        f"  syntax          : Fix the Python syntax error shown above.\n"
+        f"  structural_error: Do NOT join indicator DataFrames. Access each separately:\n"
+        f"                      ichi  = ichimoku_cloud(df, **ICHIMOKU_PARAMS)\n"
+        f"                      rsi_  = rsi(df, **RSI_PARAMS)\n"
+        f"                      atr_  = atr(df, **ATR_PARAMS)\n"
+        f"                      vwap_ = vwap(df, **VWAP_PARAMS)\n"
+        f"                    Then: ichi['bullish'], rsi_['rsi_value'], atr_['atr_value'],\n"
+        f"                          atr_['long_stop'], vwap_['above_vwap'], etc.\n"
+        f"                    NEVER use .join(), rsuffix=, or lsuffix= — column names break.\n\n"
         f"--- YOUR FAILING STRATEGY ---\n"
         f"{failed_code}\n"
         f"--- END OF FAILING STRATEGY ---\n\n"
@@ -899,8 +988,10 @@ def build_repair_prompt(
         f"<reasoning>\nWhat was wrong and what you fixed (2-3 sentences max)\n</reasoning>\n"
         f"<strategy>\nfull corrected Python code here\n</strategy>"
     )
+    # IMPROVEMENT: /no_think in system message for repair calls too.
+    system_content = "/no_think\n\n" + program_source
     return [
-        {"role": "system", "content": program_source},
+        {"role": "system", "content": system_content},
         {"role": "user",   "content": user_content},
     ]
 
@@ -1184,7 +1275,7 @@ def run(
                     vlog("ENSEMBLE GATE REJECTED",
                         f"New score {aggregate:.5f} > best {best_score:.5f} BUT "
                         f"ensemble OOS score {gate_score:.4f} < -0.30. "
-                        f"Treating as discard to prevent NVDA overfitting."
+                        f"Treating as discard to prevent overfitting."
                     )
                     status             = "discard"
                     description       += f" [ensemble_rejected gate={gate_score:.3f}]"
@@ -1344,12 +1435,16 @@ def run(
             syntax_ok,   syntax_err   = validate_syntax(candidate_code)
             contract_ok, contract_err = validate_strategy_contract(candidate_code)
             atr_ok,      atr_err      = validate_atr_formula(candidate_code)
+            # IMPROVEMENT: new validator — catches DataFrame join anti-pattern
+            # before it reaches the LLM repair loop, saving ~10 min per incident.
+            join_ok,     join_err     = validate_no_df_joins(candidate_code)
 
             vlog("VALIDATION",
                 f"Repair attempt  : {repair_attempt}/{MAX_REPAIR_ATTEMPTS}\n"
                 f"Syntax OK       : {syntax_ok}  {syntax_err or ''}\n"
                 f"Contract OK     : {contract_ok}  {contract_err or ''}\n"
                 f"ATR formula OK  : {atr_ok}  {atr_err or ''}\n"
+                f"No DF joins OK  : {join_ok}  {join_err or ''}\n"
             )
 
             # Syntax failure
@@ -1379,6 +1474,17 @@ def run(
                 if repair_attempt >= MAX_REPAIR_ATTEMPTS:
                     candidate_code = None; break
                 repair_msgs    = build_repair_prompt(program_source, candidate_code, atr_err, "atr_formula", repair_attempt)
+                candidate_code = _run_llm_repair(pipe, repair_msgs, temperature)
+                if candidate_code is None: break
+                candidate_code, _ = auto_repair_strategy(candidate_code)
+                candidate_code    = sanitise_strategy_code(candidate_code)
+                continue
+
+            # DataFrame join anti-pattern failure — IMPROVEMENT: new check
+            if not join_ok:
+                if repair_attempt >= MAX_REPAIR_ATTEMPTS:
+                    candidate_code = None; break
+                repair_msgs    = build_repair_prompt(program_source, candidate_code, join_err, "structural_error", repair_attempt)
                 candidate_code = _run_llm_repair(pipe, repair_msgs, temperature)
                 if candidate_code is None: break
                 candidate_code, _ = auto_repair_strategy(candidate_code)

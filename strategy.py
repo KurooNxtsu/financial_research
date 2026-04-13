@@ -264,6 +264,7 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
                 bool(ichi["bearish"].iloc[i])                                  # price below cloud
                 and bool(tk_below_kijun.iloc[i])                               # tenkan < kijun: momentum confirmed
                 and rsi_["rsi_value"].iloc[i] > RSI_PARAMS["overbought"] - 15  # RSI > 55: mild strength in downtrend
+                and bool(vwap_["below_vwap"].iloc[i])                          # ADDED: close < VWAP confirms real downtrend
                 and not np.isnan(atr_["short_stop"].iloc[i])
             )
 

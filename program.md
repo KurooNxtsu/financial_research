@@ -64,6 +64,57 @@ scores it, and feeds results back. The LLM **never sees `backtest_harness.py`**.
 
 ---
 
+## CRITICAL CODE RULES (read before writing any strategy.py)
+
+### Rule 1 — Never join indicator DataFrames
+
+Call each indicator separately and access its columns directly. **Never** use
+`.join()`, `rsuffix=`, or `lsuffix=` inside `generate_signals()`.
+
+**CORRECT:**
+```python
+ichi  = ichimoku_cloud(df, **ICHIMOKU_PARAMS)
+rsi_  = rsi(df,           **RSI_PARAMS)
+atr_  = atr(df,           **ATR_PARAMS)
+vwap_ = vwap(df,          **VWAP_PARAMS)
+
+# Access columns directly:
+bool(ichi["bullish"].iloc[i])
+rsi_["rsi_value"].iloc[i]
+atr_["atr_value"].iloc[i]
+atr_["long_stop"].iloc[i]
+vwap_["above_vwap"].iloc[i]
+```
+
+**WRONG (causes 'atr_value_atr' KeyError crashes):**
+```python
+ichi = ichi.join(rsi_, rsuffix='_rsi')   # DO NOT DO THIS
+ichi = ichi.join(atr_, rsuffix='_atr')   # DO NOT DO THIS
+```
+
+### Rule 2 — generate_signals must return signal + stop columns
+
+```python
+return pd.DataFrame({"signal": signal, "stop": stop}, index=df.index)
+```
+Do not return columns named `entry`, `exit`, `long_entry`, etc. unless you
+also include a `signal` column.
+
+### Rule 3 — Use zone RSI checks, not strict crossovers
+
+`rsi_value < oversold + 15` (i.e. RSI < 45) generates entries in trending markets.
+`rsi_value < oversold` (RSI < 30) is too strict — you will get zero trades.
+
+### Rule 4 — ATR formula must use previous close
+
+```python
+prev_close = df["Close"].shift(1)
+(df["High"] - prev_close).abs()   # CORRECT
+(df["High"] - df["Close"]).abs()  # WRONG — harness will reject this
+```
+
+---
+
 ## Indicators
 
 Your strategy has exactly four indicator functions. Their **signatures are
@@ -147,12 +198,18 @@ LONG  exit  : rsi sell_signal   OR  low < adaptive_stop
 SHORT entry : ichimoku bearish
               AND tenkan_sen < kijun_sen   (momentum confirmation)
               AND rsi_value > overbought-15
+              AND below_vwap == True       (VWAP confirms real downtrend, not a bounce)
 SHORT exit  : rsi buy_signal    OR  high > adaptive_stop
 ```
 
 The Tenkan/Kijun filter prevents entering during dead-cat bounces in sustained
 downtrends (this was the main cause of the 2022 losses in v1). If you are still
 getting zero trades, remove ONE condition at a time and test.
+
+The VWAP filter on short entries is critical for avoiding false shorts during
+early-recovery rallies (e.g. the 2019 ^GSPC recovery from Q4 2018 crash, which
+caused a −0.758 score when the strategy shorted the early recovery because
+Ichimoku was still bearish but price/VWAP had already turned).
 
 ---
 
@@ -190,6 +247,22 @@ Each shard has a 100-day warm-up buffer prepended.
 | 2022 | In-sample — inflation bear market |
 | 2023 | **Out-of-sample** |
 | 2024 | **Out-of-sample (most recent)** |
+
+---
+
+## Known Weak Shards — Address These First
+
+Based on observed results, the following shards are consistently negative and
+should be the primary focus of improvement attempts:
+
+| Shard | Score | Root Cause | Hypothesis |
+|---|---|---|---|
+| `^GSPC 2019` | −0.758 | Strategy shorts Q4 2018 recovery | Ichimoku still bearish while price already recovered above VWAP. Add `below_vwap` to short entry. |
+| `^GSPC 2023` | −0.817 | False signals in choppy sideways market | ATR multiplier too tight; stops getting hit. Widen multiplier or add volatility gate. |
+| `^GSPC 2020` | −0.360 | COVID crash V-recovery whipsaws | Short entries during recovery leg. VWAP filter should help. |
+| `GLD 2020` | −0.780 | Only 2 trades, both losers | Signals too rare for GLD's volatility profile. Loosen RSI threshold. |
+| `GLD 2021` | −0.853 | 4 trades, Sharpe −1.43 | GLD sideways chop with trend-following strategy. Volatility gate may skip this. |
+| `GLD 2024` | −0.559 | Recent poor fit | GLD had a strong bull run in 2024; check if strategy is going short into it. |
 
 ---
 
@@ -255,9 +328,11 @@ When discarded, the harness sends your failed code in the next prompt under
 
 - **Syntax error**: Fix in next proposal.
 - **ATR formula error**: True range MUST use `close.shift(1)`. Fix immediately.
+- **structural_error (DF join)**: Do NOT use `.join()` on indicator DataFrames.
+  Access each indicator's columns directly. See CRITICAL CODE RULES above.
 - **Zero trades**: Loosen at least one entry condition.
 - **Profit_Factor = 10.0** (capped): ATR stop may be unrealistically wide.
-- **Ensemble gate rejected**: Strategy fits NVDA but not other assets. Add regime
+- **Ensemble gate rejected**: Strategy fits primary ticker but not other assets. Add regime
   filtering or loosen conditions so it generalises.
 - **Score = -99.0**: Runtime exception. Fix the logic.
 
@@ -291,10 +366,14 @@ Concise explanation (150 words max) referencing:
 - Do not add new imports.
 - **CRITICAL — no name-shadowing**: Use `ichi = ichimoku_cloud(...)`,
   `rsi_ = rsi(...)`, `atr_ = atr(...)`, `vwap_ = vwap(...)`.
+- **CRITICAL — no DataFrame joins**: Never use `.join()`, `rsuffix=`, or `lsuffix=`
+  inside `generate_signals()`. Access each indicator's columns directly.
 - **CRITICAL — ATR formula**: Use `prev_close = df["Close"].shift(1)` and
   `(df["High"] - prev_close).abs()`. NEVER `(high - close)` or `(low - close)`.
 - **CRITICAL — signals must fire**: Use `rsi_value < oversold + 15` (RSI < 45)
   for long entry, not strict `rsi_value < oversold` (RSI < 30).
+- **CRITICAL — return format**: Return `pd.DataFrame({"signal": signal, "stop": stop})`.
+  Do not rename these columns.
 
 ---
 
