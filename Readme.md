@@ -1,6 +1,6 @@
 # AutoFin — Autonomous Financial Strategy Agent
 
-> A self-improving quantitative trading strategy agent inspired by AI Scientist / AutoResearch, running on open-source models and **free cloud GPUs** (Google Colab / Kaggle).
+> A self-improving quantitative trading strategy agent inspired by AI Scientist / AutoResearch, running on open-source models and **free cloud GPUs** that keeps changing as you run/update the code. (Google Colab / Kaggle).
 
 ![Aggregate score over 8 iterations, rising from 0.37 to 0.90](results_chart.png)
 
